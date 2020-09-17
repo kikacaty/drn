@@ -518,11 +518,51 @@ def test(eval_data_loader, model, num_classes,
                     'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                     .format(iter, len(eval_data_loader), batch_time=batch_time,
                             data_time=data_time))
+
+    # from pdb import set_trace as st
+    # st()
     if has_gt: #val
         ious = per_class_iu(hist) * 100
         logger.info(' '.join('{:.03f}'.format(i) for i in ious))
         return round(np.nanmean(ious), 2)
 
+def attack(attack_data_loader, model, num_classes,
+         output_dir='pred', has_gt=True, save_vis=False):
+    model.eval()
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    end = time.time()
+    hist = np.zeros((num_classes, num_classes))
+    for iter, (image, label, name) in enumerate(attack_data_loader):
+        data_time.update(time.time() - end)
+        image_var = Variable(image, requires_grad=False, volatile=True)
+        final = model(image_var)[0]
+        _, pred = torch.max(final, 1)
+        pred = pred.cpu().data.numpy()
+        batch_time.update(time.time() - end)
+        if save_vis:
+            save_output_images(pred, name, output_dir)
+            save_colorful_images(
+                pred, name, output_dir + '_color',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+        if has_gt:
+            label = label.numpy()
+            hist += fast_hist(pred.flatten(), label.flatten(), num_classes)
+            logger.info('===> mAP {mAP:.3f}'.format(
+                mAP=round(np.nanmean(per_class_iu(hist)) * 100, 2)))
+        end = time.time()
+        logger.info('Eval: [{0}/{1}]\t'
+                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                    'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                    .format(iter, len(attack_data_loader), batch_time=batch_time,
+                            data_time=data_time))
+
+    # from pdb import set_trace as st
+    # st()
+    if has_gt: #val
+        ious = per_class_iu(hist) * 100
+        logger.info(' '.join('{:.03f}'.format(i) for i in ious))
+        return round(np.nanmean(ious), 2)
 
 def resize_4d_tensor(tensor, width, height):
     tensor_cpu = tensor.cpu().numpy()
@@ -672,15 +712,85 @@ def test_seg(args):
                       output_dir=out_dir,
                       scales=scales)
     else:
+        # from pdb import set_trace as st
+        # st()
         mAP = test(test_loader, model, args.classes, save_vis=True,
-                   has_gt=phase != 'test' or args.with_gt, output_dir=out_dir)
+                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir)
     logger.info('mAP: %f', mAP)
 
+
+def attack_seg(args):
+    batch_size = args.batch_size
+    num_workers = args.workers
+    phase = args.phase
+
+    for k, v in args.__dict__.items():
+        print(k, ':', v)
+
+    single_model = DRNSeg(args.arch, args.classes, pretrained_model=None,
+                          pretrained=False)
+    if args.pretrained:
+        single_model.load_state_dict(torch.load(args.pretrained))
+    model = torch.nn.DataParallel(single_model).cuda()
+
+    data_dir = args.data_dir
+    info = json.load(open(join(data_dir, 'info.json'), 'r'))
+    normalize = transforms.Normalize(mean=info['mean'], std=info['std'])
+    scales = [0.5, 0.75, 1.25, 1.5, 1.75]
+    if args.ms:
+        dataset = SegListMS(data_dir, phase, transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ]), scales, list_dir=args.list_dir)
+    else:
+        dataset = SegList(data_dir, phase, transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ]), list_dir=args.list_dir, out_name=True)
+    test_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=False
+    )
+
+    cudnn.benchmark = True
+
+    # optionally resume from a checkpoint
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            logger.info("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            logger.info("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            logger.info("=> no checkpoint found at '{}'".format(args.resume))
+
+    out_dir = '{}_{:03d}_{}'.format(args.arch, start_epoch, phase)
+    if len(args.test_suffix) > 0:
+        out_dir += '_' + args.test_suffix
+    if args.ms:
+        out_dir += '_ms'
+
+    if args.ms:
+        mAP = test_ms(test_loader, model, args.classes, save_vis=True,
+                      has_gt=phase != 'test' or args.with_gt,
+                      output_dir=out_dir,
+                      scales=scales)
+    else:
+        # from pdb import set_trace as st
+        # st()
+        mAP = attack(test_loader, model, args.classes, save_vis=True,
+                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir)
+    logger.info('mAP: %f', mAP)
 
 def parse_args():
     # Training settings
     parser = argparse.ArgumentParser(description='')
-    parser.add_argument('cmd', choices=['train', 'test'])
+    parser.add_argument('cmd', choices=['train', 'test', 'attack'])
     parser.add_argument('-d', '--data-dir', default=None, required=True)
     parser.add_argument('-l', '--list-dir', default=None,
                         help='List dir to look for train_images.txt etc. '
@@ -742,6 +852,8 @@ def main():
         train_seg(args)
     elif args.cmd == 'test':
         test_seg(args)
+    elif args.cmd == 'attack':
+        attack_seg(args)
 
 
 if __name__ == '__main__':
