@@ -15,16 +15,20 @@ import numpy as np
 import shutil
 
 import sys
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.autograd import Variable
+from torch.nn import functional as F
+
 
 import drn
 import data_transforms as transforms
+
+from pdb import set_trace as st
 
 try:
     from modules import batchnormsync
@@ -36,6 +40,8 @@ logging.basicConfig(format=FORMAT)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+NORM_MEAN = np.array([0.29010095242892997, 0.32808144844279574, 0.28696394422942517])
+NORM_STD = np.array([0.1829540508368939, 0.18656561047509476, 0.18447508988480435])
 
 CITYSCAPE_PALETTE = np.asarray([
     [128, 64, 128],
@@ -221,7 +227,8 @@ def validate(val_loader, model, criterion, eval_score=None, print_freq=10):
 
         # measure accuracy and record loss
         # prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
+        # losses.update(loss.data[0], input.size(0))
+        losses.update(loss.data, input.size(0))
         if eval_score is not None:
             score.update(eval_score(output, target_var), input.size(0))
 
@@ -270,7 +277,8 @@ def accuracy(output, target):
     correct = correct[target != 255]
     correct = correct.view(-1)
     score = correct.float().sum(0).mul(100.0 / correct.size(0))
-    return score.data[0]
+    # return score.data[0]
+    return score.data
 
 
 def train(train_loader, model, criterion, optimizer, epoch,
@@ -304,7 +312,8 @@ def train(train_loader, model, criterion, optimizer, epoch,
 
         # measure accuracy and record loss
         # prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
+        losses.update(loss.data, input.size(0))
+        # losses.update(loss.data[0], input.size(0))
         if eval_score is not None:
             scores.update(eval_score(output, target_var), input.size(0))
 
@@ -422,6 +431,8 @@ def train_seg(args):
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
         checkpoint_path = os.path.join(args.save_path, 'checkpoint_latest.pth.tar')
+        if not os.path.exists(args.save_path):
+            os.makedirs(args.save_path)
         save_checkpoint({
             'epoch': epoch + 1,
             'arch': args.arch,
@@ -487,6 +498,83 @@ def save_colorful_images(predictions, filenames, output_dir, palettes):
            os.makedirs(out_dir)
        im.save(fn)
 
+def save_colorful_images_with_mask(predictions, filenames, output_dir, palettes,
+     p_mask=((0,0),(0,0)), t_mask=((0,0),(0,0)),rf_mask=((0,0),(0,0))):
+    """
+    Saves a given (B x C x H x W) into an image file.
+    If given a mini-batch tensor, will save the tensor as a grid of images.
+    """
+
+    for ind in range(len(filenames)):
+        im = Image.fromarray(palettes[predictions[ind].squeeze()]).convert("RGBA")
+
+        overlay = Image.new('RGBA', im.size, (0,0,0,0))
+        draw = ImageDraw.Draw(overlay)  # Create a context for drawing things on it.
+        draw.rectangle(p_mask, fill=(255,0,0,70))
+
+        # Alpha composite these two images together to obtain the desired result.
+        im = Image.alpha_composite(im, overlay)
+
+        overlay = Image.new('RGBA', im.size, (0,0,0,0))
+        draw = ImageDraw.Draw(overlay)  # Create a context for drawing things on it.
+        draw.rectangle(t_mask, fill=(0,255,0,70))
+
+        im = Image.alpha_composite(im, overlay)
+
+        overlay = Image.new('RGBA', im.size, (0,0,0,0))
+        draw = ImageDraw.Draw(overlay)  # Create a context for drawing things on it.
+        draw.rectangle(rf_mask, fill=(0,0,255,70))
+
+        # Alpha composite these two images together to obtain the desired result.
+        im = Image.alpha_composite(im, overlay).convert("RGB")
+
+        fn = os.path.join(output_dir, filenames[ind][:-4] + '.png')
+        out_dir = split(fn)[0]
+        if not exists(out_dir):
+            os.makedirs(out_dir)
+        im.save(fn)
+
+def save_colorful_images_with_pointwise_mask(predictions, filenames, output_dir, palettes,
+     p_mask=None, t_mask=None,rf_mask=None):
+    """
+    Saves a given (B x C x H x W) into an image file.
+    If given a mini-batch tensor, will save the tensor as a grid of images.
+    """
+
+    for ind in range(len(filenames)):
+        im = Image.fromarray(palettes[predictions[ind].squeeze()]).convert("RGBA")
+
+        overlay = Image.new('RGBA', im.size, (0,0,0,0))
+        draw = ImageDraw.Draw(overlay)  # Create a context for drawing things on it.
+        p_mask = Image.fromarray(p_mask[0,0].astype(np.uint8)*255, mode='L')
+        draw.bitmap((0, 0), p_mask, fill=(255,0,0,70))
+
+        # Alpha composite these two images together to obtain the desired result.
+        im = Image.alpha_composite(im, overlay)
+
+        overlay = Image.new('RGBA', im.size, (0,0,0,0))
+        draw = ImageDraw.Draw(overlay)  # Create a context for drawing things on it.
+        t_mask = Image.fromarray(t_mask[0].astype(np.uint8)*255, mode='L')
+        draw.bitmap((0, 0), t_mask, fill=(0,255,0,70))
+
+        im = Image.alpha_composite(im, overlay)
+
+        if rf_mask is not None:
+
+            overlay = Image.new('RGBA', im.size, (0,0,0,0))
+            draw = ImageDraw.Draw(overlay)  # Create a context for drawing things on it.
+            rf_mask = Image.fromarray(rf_mask.astype(np.uint8)*255, mode='L')
+            draw.bitmap((0, 0), rf_mask, fill=(0,0,255,70))
+
+            # Alpha composite these two images together to obtain the desired result.
+            im = Image.alpha_composite(im, overlay).convert("RGB")
+
+        fn = os.path.join(output_dir, filenames[ind][:-4] + '.png')
+        out_dir = split(fn)[0]
+        if not exists(out_dir):
+            os.makedirs(out_dir)
+        im.save(fn)
+
 
 def test(eval_data_loader, model, num_classes,
          output_dir='pred', has_gt=True, save_vis=False):
@@ -526,6 +614,263 @@ def test(eval_data_loader, model, num_classes,
         logger.info(' '.join('{:.03f}'.format(i) for i in ious))
         return round(np.nanmean(ious), 2)
 
+def measureRFSize(model, image, t_patch_pos, t_patch_size, t_rec,thres = 0):
+    # measure receptive field size of the model empirically
+    
+    # measuring receptive field
+    height, width = image.cpu().numpy().shape[2:]
+
+
+    test = torch.ones_like(image)
+    test_var = Variable(test)
+
+    logits = torch.sum(model(test_var)[0], 1)
+
+    # test[:,:,t_patch_pos[0]-t_patch_size/2:t_patch_pos[0]+t_patch_size/2,t_patch_pos[1]-t_patch_size/2:t_patch_pos[1]+t_patch_size/2] = 0
+    test[:,:,t_rec[0][1]:t_rec[1][1],
+            t_rec[0][0]:t_rec[1][0]] = 0
+
+    test_var_p = Variable(test)
+
+    logits_p = torch.sum(model(test_var_p)[0], 1)
+
+    loss = nn.NLLLoss2d(ignore_index=255)
+
+
+    mask_idx = np.where((logits-logits_p).cpu().data.numpy()!=0)
+
+    h = mask_idx[1].max() - mask_idx[1].min()
+    w = mask_idx[2].max() - mask_idx[2].min()
+
+    pt_wise_mask = (np.abs((logits-logits_p).cpu().data.numpy())/np.abs((logits-logits_p).cpu().data.numpy()).max()>=thres)[0]
+    coord_mask = ((mask_idx[2].min(),mask_idx[1].min()),((mask_idx[2].max(),mask_idx[1].max())))
+
+    return h,w,coord_mask,pt_wise_mask
+
+def measureRFSize_pt(model, image, label, target_mask,thres = 0):
+    # measure receptive field size of the model empirically
+    
+    # measuring receptive field
+    height, width = image.cpu().numpy().shape[2:]
+
+
+    images = image.cuda()
+    # t_labels = torch.ones_like(label)
+    t_labels = torch.zeros_like(label)
+    labels = t_labels.cuda(async=True)
+
+    u_labels = label.cuda(async=True)
+
+    images = torch.autograd.Variable(images)
+    labels = torch.autograd.Variable(labels)
+    labels = torch.autograd.Variable(u_labels)
+
+    target_mask = torch.from_numpy(target_mask).cuda()
+
+    # loss = nn.CrossEntropyLoss()
+    loss = nn.NLLLoss2d(ignore_index=255)
+
+    images.requires_grad = True
+    outputs = model(images)[0]
+
+    model.zero_grad()
+
+    # cost = -loss(outputs*target_mask, labels*target_mask) #+ loss(outputs*target_mask, u_labels*target_mask)
+    # cost = loss(outputs*target_mask, u_labels*target_mask)
+    cost = loss(outputs*target_mask, labels*target_mask)
+
+    cost.backward()
+    grad = images.grad.cpu().numpy()
+    grad = (np.abs(grad)/np.abs(grad).max()).sum(axis = 1)
+
+    mask_idx = np.where(grad!=0)
+
+    h = mask_idx[1].max() - mask_idx[1].min()
+    w = mask_idx[2].max() - mask_idx[2].min()
+
+    pt_wise_mask = (grad>=thres)[0]
+    coord_mask = ((mask_idx[2].min(),mask_idx[1].min()),((mask_idx[2].max(),mask_idx[1].max())))
+
+    return h,w,coord_mask,pt_wise_mask
+
+def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1):
+    images = image.cuda()
+    t_labels = torch.ones_like(label)
+    # t_labels = torch.zeros_like(label)
+    labels = t_labels.cuda(async=True)
+
+    u_labels = label.cuda(async=True)
+
+    # images = torch.autograd.Variable(images)
+    # labels = torch.autograd.Variable(labels)
+    u_labels = torch.autograd.Variable(u_labels)
+
+    upper_mask = np.zeros_like(target_mask)
+    upper_mask[:,0:430,:] = 1
+    upper_mask = torch.from_numpy(upper_mask).cuda()
+    lower_mask = np.zeros_like(target_mask)
+    lower_mask[:,430:,:] = 1
+    lower_mask = torch.from_numpy(lower_mask).cuda()
+
+    target_mask = torch.from_numpy(target_mask).cuda()
+    perturb_mask = torch.from_numpy(perturb_mask).cuda()
+
+    mean = torch.from_numpy(NORM_MEAN).float().cuda().unsqueeze(0)
+    mean = mean[..., None, None]
+    std = torch.from_numpy(NORM_STD).float().cuda().unsqueeze(0)
+    std = std[..., None, None]
+
+    # loss = nn.CrossEntropyLoss()
+    loss = nn.NLLLoss2d(ignore_index=255)
+
+    h_loss = houdini_loss()
+
+    best_adv_img = [images.data, -1e8]
+
+    ori_images = images.data * std + mean
+
+    # scaling the attack eps
+    # eps *= 1.7585+3.8802
+
+    restarts = 1
+    
+    for j in range(restarts):
+        delta = torch.rand_like(images, requires_grad=True)
+        # delta = torch.zeros_like(images, requires_grad=True)
+        delta.data = (delta.data * 2 * eps - eps) * perturb_mask
+
+        for i in range(iters) :  
+            step_size  = np.max([1e-3, step_size * 0.99])  
+            images.requires_grad = False
+            delta.requires_grad = True
+            outputs = model((torch.clamp(((images*std+mean)+delta),min=0, max=1)- mean)/std)[0]
+
+            model.zero_grad()
+
+            # targeted attack
+            # cost = -loss(outputs*target_mask, labels*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+            # cost = -h_loss(outputs*target_mask, labels*target_mask) - alpha * h_loss(outputs*perturb_mask[:,0,:,:], labels*perturb_mask[:,0,:,:])
+
+            # untargeted attack
+            # cost = loss(outputs*target_mask, u_labels*target_mask)
+            # cost = loss(outputs*target_mask, u_labels*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], labels*perturb_mask[:,0,:,:])
+
+            # mixed attack
+            # cost = -loss(outputs*target_mask, labels*2*target_mask) - loss(outputs*target_mask, labels*0*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+            
+            print(loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask).data, loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask).data, loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:]).data)
+            cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+            # cost = - 3*loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+            # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+
+            cost.backward()
+            print(i,cost)
+
+            adv_images = (images*std+mean) + delta + step_size*eps*delta.grad.sign() * perturb_mask
+            eta = torch.clamp(adv_images - ori_images, min=-eps, max=eps)
+            delta = torch.clamp(ori_images + eta, min=0, max=1).detach_() - ori_images
+
+
+            if cost.cpu().data.numpy() > best_adv_img[1]:
+                best_adv_img = [delta.data, cost.cpu().data.numpy()]
+
+            
+    return (torch.clamp(((images*std+mean)+best_adv_img[0]),min=0, max=1)- mean)/std
+
+def cw(model, image, label, target_mask, perturb_mask, step_size = 0.05, eps=10/255., iters=10, alpha = 0.1):
+    images = image.cuda()
+    # t_labels = torch.ones_like(label)
+    t_labels = torch.zeros_like(label)
+    labels = t_labels.cuda(async=True)
+
+    u_labels = label.cuda(async=True)
+
+    images = torch.autograd.Variable(images)
+    labels = torch.autograd.Variable(labels)
+    u_labels = torch.autograd.Variable(u_labels)
+
+    target_mask = torch.from_numpy(target_mask).cuda()
+    perturb_mask = torch.from_numpy(perturb_mask).cuda()
+
+    mean = torch.from_numpy(NORM_MEAN).float().cuda().unsqueeze(0)
+    mean = mean[..., None, None]
+    std = torch.from_numpy(NORM_STD).float().cuda().unsqueeze(0)
+    std = std[..., None, None]
+
+    # loss = nn.CrossEntropyLoss()
+    loss = nn.NLLLoss2d(ignore_index=255)
+
+    best_adv_img = [images.data, -1e8]
+
+    ori_images = images.data * std + mean
+
+    # scaling the attack eps
+    # eps *= 1.7585+3.8802
+
+    h_loss = houdini_loss()
+        
+    for i in range(iters) :    
+        images.requires_grad = True
+        outputs = model(images)[0]
+
+        model.zero_grad()
+
+        # cost = -loss(outputs*target_mask, labels*target_mask) #+ loss(outputs*target_mask, u_labels*target_mask)
+        # cost = loss(outputs*target_mask, u_labels*target_mask)
+        cost = - h_loss(outputs*target_mask, labels*target_mask)
+        print(cost)
+
+        cost.backward()
+
+        adv_images = (images*std+mean) + step_size*eps*images.grad * perturb_mask / torch.max(torch.abs(images.grad * perturb_mask))
+        # adv_images = (images*std+mean) + step_size*eps*images.grad / torch.max(torch.abs(images.grad))
+        eta = torch.clamp(adv_images - ori_images, min=-eps, max=eps)
+        images = ((torch.clamp(ori_images + eta, min=0, max=1) - mean)/std).detach_()
+
+        if cost.cpu().data.numpy() > best_adv_img[1]:
+            best_adv_img = [images.data, cost.cpu().data.numpy()]
+
+            
+    return best_adv_img[0]
+
+class houdini_loss(nn.Module):
+    def __init__(self, use_cuda=True, num_class=19, ignore_index=255):
+        super(houdini_loss, self).__init__()
+        # self.cross_entropy = nn.CrossEntropyLoss(ignore_index=255)
+        self.use_cuda = use_cuda
+        self.num_class = num_class
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, target):
+        pred = logits.max(1)[1].data
+        target = target.data
+        size = list(target.size())
+        if self.ignore_index is not None:
+            pred[pred == self.ignore_index] = self.num_class
+            target[target == self.ignore_index] = self.num_class
+        pred = torch.unsqueeze(pred, dim=1)
+        target = torch.unsqueeze(target, dim=1)
+        size.insert(1, self.num_class+1)
+        pred_onehot = torch.zeros(size)
+        target_onehot = torch.zeros(size)
+        if self.use_cuda:
+            pred_onehot = pred_onehot.cuda()
+            target_onehot = target_onehot.cuda()
+        pred_onehot = pred_onehot.scatter_(1, pred, 1).narrow(1, 0, self.num_class)
+
+        target_onehot = target_onehot.scatter_(1, target, 1).narrow(1, 0, self.num_class)
+        pred_onehot = Variable(pred_onehot)
+        target_onehot = Variable(target_onehot)
+        neg_log_softmax = -F.log_softmax(logits, dim=1)
+        # print(logits.size())
+        # print(neg_log_softmax.size())
+        # print(target_onehot.size())
+        twod_cross_entropy = torch.sum(neg_log_softmax*target_onehot, dim=1)
+        pred_score = torch.sum(logits*pred_onehot, dim=1)
+        target_score = torch.sum(logits*target_onehot, dim=1)
+        mask = 0.5 + 0.5 * (((pred_score-target_score)/math.sqrt(2)).erf())
+        return torch.mean(mask * twod_cross_entropy)
+
 def attack(attack_data_loader, model, num_classes,
          output_dir='pred', has_gt=True, save_vis=False):
     model.eval()
@@ -533,32 +878,106 @@ def attack(attack_data_loader, model, num_classes,
     data_time = AverageMeter()
     end = time.time()
     hist = np.zeros((num_classes, num_classes))
+    t_hist = hist.copy()
     for iter, (image, label, name) in enumerate(attack_data_loader):
         data_time.update(time.time() - end)
-        image_var = Variable(image, requires_grad=False, volatile=True)
-        final = model(image_var)[0]
-        _, pred = torch.max(final, 1)
-        pred = pred.cpu().data.numpy()
-        batch_time.update(time.time() - end)
-        if save_vis:
-            save_output_images(pred, name, output_dir)
-            save_colorful_images(
-                pred, name, output_dir + '_color',
-                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-        if has_gt:
-            label = label.numpy()
-            hist += fast_hist(pred.flatten(), label.flatten(), num_classes)
-            logger.info('===> mAP {mAP:.3f}'.format(
-                mAP=round(np.nanmean(per_class_iu(hist)) * 100, 2)))
-        end = time.time()
-        logger.info('Eval: [{0}/{1}]\t'
-                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                    'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                    .format(iter, len(attack_data_loader), batch_time=batch_time,
-                            data_time=data_time))
 
-    # from pdb import set_trace as st
-    # st()
+        height, width = image.shape[2:]
+
+        patch_size = (50,300)
+        target_size = 300
+        patch_pos = (450,1100)
+        patch_pos = (520,1100)
+        patch_rec = ((patch_pos[1] - patch_size[1]//2, patch_pos[0] - patch_size[0]//2),
+            (patch_pos[1] + patch_size[1]//2, patch_pos[0] + patch_size[0]//2))
+        target_pos = (380,1100)
+        # target_pos = (280,1100)
+        target_rec = ((target_pos[1] - target_size//2, target_pos[0] - target_size//2),
+            (target_pos[1] + target_size//2, target_pos[0] + target_size//2))
+
+        target_mask = np.zeros_like(label)
+        # target_mask = np.ones_like(label)
+        perturb_mask = np.zeros_like(image)
+        target_mask[:,target_rec[0][1]:target_rec[1][1],
+            target_rec[0][0]:target_rec[1][0]] = 1
+        target_mask = (((label == 13) | (label == 6) | (label == 7)).numpy() & (target_mask ==1)).astype(np.int8) # traffic sign and car
+        perturb_mask[:,:,patch_rec[0][1]:patch_rec[1][1],
+            patch_rec[0][0]:patch_rec[1][0]] = 1
+        perturb_mask = perturb_mask.astype(np.int8)
+
+        # adding perturb area to target as well 
+        # to avoid spoofing new obstacle at the attack perturbation area
+        loss_mask = target_mask.copy()
+        # loss_mask[:,patch_rec[0][1]:patch_rec[1][1],
+        #     patch_rec[0][0]:patch_rec[1][0]] = 1
+
+        # measure receptive field
+        rf_h, rf_w, rf_mask, rf_mask_bit = measureRFSize_pt(model, image, label, target_mask, thres = 1.)
+        print('receptive size: ',rf_h, rf_w)
+
+        # Tuning attack hyper params
+        step_size_list = [0.1, 0.2, 0.5, 1.0]
+        step_size_list = [1.0]
+        eps_list = [10./255, 50./255, 100./255, 200./255]
+        eps_list = [1.]
+
+        for step_size in step_size_list:
+            print('step size: ',step_size)
+            for eps in eps_list:
+                print('eps: ', eps)
+
+                adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=50, alpha=1)
+                # adv_image = cw(model,image,label,loss_mask,perturb_mask, step_size = step_size, eps=eps, iters=200)
+                # adv_image = pgd(model,image,label,target_mask,perturb_mask, step_size = 0.2, eps=50./255, iters=50, targeted=False)
+
+                image_var = Variable(adv_image)
+                final = model(image_var)[0]
+                _, pred = torch.max(final, 1)
+                pred = pred.cpu().data.numpy()
+                batch_time.update(time.time() - end)
+                if save_vis:
+                    save_output_images(pred, name, output_dir)
+                    adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+                    adv_img *= 255
+                    save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
+                    save_colorful_images(
+                        pred, name, output_dir + '_color',
+                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+                    # save_colorful_images_with_mask(
+                    #     pred, name, output_dir + '_color_patch',
+                    #     TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
+                    #     p_mask = patch_rec,
+                    #     t_mask = target_rec,
+                    #     rf_mask = rf_mask)
+                    # upper_mask = np.zeros_like(target_mask)
+                    # upper_mask[:,0:430,:] = 1
+                    save_colorful_images_with_pointwise_mask(
+                        pred, name, output_dir + '_color_patch',
+                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
+                        p_mask = perturb_mask,
+                        t_mask = target_mask,
+                        rf_mask = rf_mask_bit)
+                if has_gt:
+                    label_np = label.numpy()
+                    t_hist += fast_hist(pred[:,target_rec[0][1]:target_rec[1][1],
+                    target_rec[0][0]:target_rec[1][0]].flatten(), 
+                        label_np[:,target_rec[0][1]:target_rec[1][1],
+                    target_rec[0][0]:target_rec[1][0]].flatten(),19)
+                    hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
+
+                    logger.info('===> mAP {mAP:.3f}'.format(
+                        mAP=round(np.nanmean(per_class_iu(t_hist)) * 100, 2)))
+                    # logger.info('===> mAP {mAP:.3f}'.format(
+                    #     mAP=round(np.nanmean(per_class_iu(hist)) * 100, 2)))
+                end = time.time()
+                st()
+                logger.info('Eval: [{0}/{1}]\t'
+                            'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                            'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                            .format(iter, len(attack_data_loader), batch_time=batch_time,
+                                    data_time=data_time))
+
+
     if has_gt: #val
         ious = per_class_iu(hist) * 100
         logger.info(' '.join('{:.03f}'.format(i) for i in ious))
@@ -769,7 +1188,7 @@ def attack_seg(args):
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
-    out_dir = '{}_{:03d}_{}'.format(args.arch, start_epoch, phase)
+    out_dir = '{}_{:03d}_{}_attack'.format(args.arch, start_epoch, phase)
     if len(args.test_suffix) > 0:
         out_dir += '_' + args.test_suffix
     if args.ms:
