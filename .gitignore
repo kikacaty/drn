@@ -1,0 +1,14 @@
+drn_d_22_000*
+datasets/cityscape/gtFine
+.vscode
+drn_d_*
+resnet_d_*
+test*
+*.pth.tar
+__pycache__
+log/*
+figs/*
+duc_hdc_*
+datasets/cityscapes
+*.pth
+debug/*
