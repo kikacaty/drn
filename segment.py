@@ -883,7 +883,7 @@ class houdini_loss(nn.Module):
         return torch.mean(mask * twod_cross_entropy)
 
 def attack(attack_data_loader, model, num_classes,
-         output_dir='pred', has_gt=True, save_vis=False):
+         output_dir='pred', has_gt=True, save_vis=False, pgd_steps=0):
     model.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -942,7 +942,10 @@ def attack(attack_data_loader, model, num_classes,
             for eps in eps_list:
                 print('eps: ', eps)
 
-                adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=100, alpha=0.3)
+                if pgd_steps == 0:
+                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
+                else:
+                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=0.3)
                 # adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
                 # adv_image = cw(model,image,label,loss_mask,perturb_mask, step_size = step_size, eps=eps, iters=200)
                 # adv_image = pgd(model,image,label,target_mask,perturb_mask, step_size = 0.2, eps=50./255, iters=50, targeted=False)
@@ -1236,7 +1239,7 @@ def attack_seg(args):
         # from pdb import set_trace as st
         # st()
         mAP = attack(test_loader, model, args.classes, save_vis=True,
-                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir)
+                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps=args.pgd_steps)
     logger.info('mAP: %f', mAP)
 
 def parse_args():
@@ -1287,6 +1290,7 @@ def parse_args():
                         help='Turn on multi-scale testing')
     parser.add_argument('--with-gt', action='store_true')
     parser.add_argument('--test-suffix', default='', type=str)
+    parser.add_argument('--pgd-steps', default=0, type=int)
     args = parser.parse_args()
 
     assert args.classes > 0
