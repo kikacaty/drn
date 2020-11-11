@@ -883,7 +883,7 @@ class houdini_loss(nn.Module):
         return torch.mean(mask * twod_cross_entropy)
 
 def attack(attack_data_loader, model, num_classes,
-         output_dir='pred', has_gt=True, save_vis=False, pgd_steps=0):
+         output_dir='pred', has_gt=True, save_vis=False, pgd_steps=0, eval_num = 100):
     model.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -1010,7 +1010,7 @@ def attack(attack_data_loader, model, num_classes,
                             .format(iter, len(attack_data_loader), batch_time=batch_time,
                                     data_time=data_time))
 
-        if iter > 10:
+        if iter > eval_num:
                     break
     if has_gt: #val
         ious = per_class_iu(hist) * 100
@@ -1239,7 +1239,7 @@ def attack_seg(args):
         # from pdb import set_trace as st
         # st()
         mAP = attack(test_loader, model, args.classes, save_vis=True,
-                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps=args.pgd_steps)
+                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps=args.pgd_steps,eval_num=args.eval_num)
     logger.info('mAP: %f', mAP)
 
 def parse_args():
@@ -1291,6 +1291,7 @@ def parse_args():
     parser.add_argument('--with-gt', action='store_true')
     parser.add_argument('--test-suffix', default='', type=str)
     parser.add_argument('--pgd-steps', default=0, type=int)
+    parser.add_argument('--eval-num', default=100, type=int)
     args = parser.parse_args()
 
     assert args.classes > 0
