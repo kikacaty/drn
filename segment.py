@@ -28,17 +28,16 @@ from torch.nn import functional as F
 import drn
 import data_transforms as transforms
 
+import pydensecrf.densecrf as dcrf
+from pydensecrf.utils import unary_from_labels, unary_from_softmax, create_pairwise_bilateral
+
+
 from pdb import set_trace as st
 
 try:
     from modules import batchnormsync
 except ImportError:
     pass
-
-FORMAT = "[%(asctime)-15s %(filename)s:%(lineno)d %(funcName)s] %(message)s"
-logging.basicConfig(format=FORMAT)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 NORM_MEAN = np.array([0.29010095242892997, 0.32808144844279574, 0.28696394422942517])
 NORM_STD = np.array([0.1829540508368939, 0.18656561047509476, 0.18447508988480435])
@@ -71,7 +70,6 @@ TRIPLET_PALETTE = np.asarray([
     [217, 83, 79, 255],
     [91, 192, 222, 255]], dtype=np.uint8)
 
-
 def fill_up_weights(up):
     w = up.weight.data
     f = math.ceil(w.size(2) / 2)
@@ -83,13 +81,47 @@ def fill_up_weights(up):
     for c in range(1, w.size(0)):
         w[c, 0, :, :] = w[0, 0, :, :]
 
+class DRNSegCRF(nn.Module):
+    def __init__(self, model_name, classes, pretrained_model=None,
+                 pretrained=True, use_torch_up=False):
+        super(DRNSegCRF, self).__init__()
+
+        self.drnseg = DRNSeg(model_name, classes, pretrained_model=pretrained_model,
+                             pretrained=pretrained, use_torch_up=use_torch_up)
+
+        self.seg = nn.Conv2d(model.out_dim, classes,
+                             kernel_size=1, bias=True)
+        self.softmax = nn.LogSoftmax()
+        m = self.seg
+        n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+        m.weight.data.normal_(0, math.sqrt(2. / n))
+        m.bias.data.zero_()
+        if use_torch_up:
+            self.up = nn.UpsamplingBilinear2d(scale_factor=8)
+        else:
+            up = nn.ConvTranspose2d(classes, classes, 16, stride=8, padding=4,
+                                    output_padding=0, groups=classes,
+                                    bias=False)
+            fill_up_weights(up)
+            up.weight.requires_grad = False
+            self.up = up
+
+    def forward(self, x):
+        return self.drnseg(x)
+
+    def optim_parameters(self, memo=None):
+        for param in self.base.parameters():
+            yield param
+        for param in self.seg.parameters():
+            yield param
+
 
 class DRNSeg(nn.Module):
     def __init__(self, model_name, classes, pretrained_model=None,
                  pretrained=True, use_torch_up=False):
         super(DRNSeg, self).__init__()
         model = drn.__dict__.get(model_name)(
-            pretrained=pretrained, num_classes=1000)
+            pretrained=pretrained, num_classes=1000, out_middle=True)
         pmodel = nn.DataParallel(model)
         if pretrained_model is not None:
             pmodel.load_state_dict(pretrained_model)
@@ -113,10 +145,13 @@ class DRNSeg(nn.Module):
             self.up = up
 
     def forward(self, x):
-        x = self.base(x)
+        middle = list()
+        for layer in self.base:
+            x = layer(x)
+            middle.append(x)
         x = self.seg(x)
         y = self.up(x)
-        return self.softmax(y), x
+        return self.softmax(y), x, y, middle
 
     def optim_parameters(self, memo=None):
         for param in self.base.parameters():
@@ -212,37 +247,38 @@ def validate(val_loader, model, criterion, eval_score=None, print_freq=10):
     model.eval()
 
     end = time.time()
-    for i, (input, target) in enumerate(val_loader):
-        if type(criterion) in [torch.nn.modules.loss.L1Loss,
-                               torch.nn.modules.loss.MSELoss]:
-            target = target.float()
-        input = input.cuda()
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            if type(criterion) in [torch.nn.modules.loss.L1Loss,
+                                torch.nn.modules.loss.MSELoss]:
+                target = target.float()
+            input = input.cuda()
+            target = target.cuda(async=True)
+            input_var = torch.autograd.Variable(input, volatile=True)
+            target_var = torch.autograd.Variable(target, volatile=True)
 
-        # compute output
-        output = model(input_var)[0]
-        loss = criterion(output, target_var)
+            # compute output
+            output = model(input_var)[0]
+            loss = criterion(output, target_var)
 
-        # measure accuracy and record loss
-        # prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        # losses.update(loss.data[0], input.size(0))
-        losses.update(loss.data, input.size(0))
-        if eval_score is not None:
-            score.update(eval_score(output, target_var), input.size(0))
+            # measure accuracy and record loss
+            # prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            # losses.update(loss.data[0], input.size(0))
+            losses.update(loss.data, input.size(0))
+            if eval_score is not None:
+                score.update(eval_score(output, target_var), input.size(0))
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-        if i % print_freq == 0:
-            logger.info('Test: [{0}/{1}]\t'
-                        'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                        'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                        'Score {score.val:.3f} ({score.avg:.3f})'.format(
-                i, len(val_loader), batch_time=batch_time, loss=losses,
-                score=score))
+            if i % print_freq == 0:
+                logger.info('Test: [{0}/{1}]\t'
+                            'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                            'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                            'Score {score.val:.3f} ({score.avg:.3f})'.format(
+                    i, len(val_loader), batch_time=batch_time, loss=losses,
+                    score=score))
 
     logger.info(' * Score {top1.avg:.3f}'.format(top1=score))
 
@@ -307,6 +343,7 @@ def train(train_loader, model, criterion, optimizer, epoch,
         target_var = torch.autograd.Variable(target)
 
         # compute output
+        st()
         output = model(input_var)[0]
         loss = criterion(output, target_var)
 
@@ -341,6 +378,107 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
 
+
+def train_seg_crf(args):
+    batch_size = args.batch_size
+    num_workers = args.workers
+    crop_size = args.crop_size
+
+    print(' '.join(sys.argv))
+
+    for k, v in args.__dict__.items():
+        print(k, ':', v)
+
+    single_model = DRNSeg(args.arch, args.classes, None,
+                          pretrained=True)
+    if args.pretrained:
+        single_model.load_state_dict(torch.load(args.pretrained))
+    model = torch.nn.DataParallel(single_model).cuda()
+    criterion = nn.NLLLoss2d(ignore_index=255)
+
+    criterion.cuda()
+
+    # Data loading code
+    data_dir = args.data_dir
+    info = json.load(open(join(data_dir, 'info.json'), 'r'))
+    normalize = transforms.Normalize(mean=info['mean'],
+                                     std=info['std'])
+    t = []
+    if args.random_rotate > 0:
+        t.append(transforms.RandomRotate(args.random_rotate))
+    if args.random_scale > 0:
+        t.append(transforms.RandomScale(args.random_scale))
+    t.extend([transforms.RandomCrop(crop_size),
+              transforms.RandomHorizontalFlip(),
+              transforms.ToTensor(),
+              normalize])
+    train_loader = torch.utils.data.DataLoader(
+        SegList(data_dir, 'train', transforms.Compose(t),
+                list_dir=args.list_dir),
+        batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=True, drop_last=True
+    )
+    val_loader = torch.utils.data.DataLoader(
+        SegList(data_dir, 'val', transforms.Compose([
+            transforms.RandomCrop(crop_size),
+            transforms.ToTensor(),
+            normalize,
+        ]), list_dir=args.list_dir),
+        batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True, drop_last=True
+    )
+
+    # define loss function (criterion) and pptimizer
+    optimizer = torch.optim.SGD(single_model.optim_parameters(),
+                                args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+
+    cudnn.benchmark = True
+    best_prec1 = 0
+    start_epoch = 0
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    if args.evaluate:
+        validate(val_loader, model, criterion, eval_score=accuracy)
+        return
+
+    for epoch in range(start_epoch, args.epochs):
+        lr = adjust_learning_rate(args, optimizer, epoch)
+        logger.info('Epoch: [{0}]\tlr {1:.06f}'.format(epoch, lr))
+        # train for one epoch
+        train(train_loader, model, criterion, optimizer, epoch,
+              eval_score=accuracy)
+
+        # evaluate on validation set
+        prec1 = validate(val_loader, model, criterion, eval_score=accuracy)
+
+        is_best = prec1 > best_prec1
+        best_prec1 = max(prec1, best_prec1)
+        checkpoint_path = os.path.join(args.save_path, 'checkpoint_latest.pth.tar')
+        if not os.path.exists(args.save_path):
+            os.makedirs(args.save_path)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'arch': args.arch,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_prec1,
+        }, is_best, filename=checkpoint_path)
+        if (epoch + 1) % args.save_iter == 0:
+            history_path = os.path.join(args.save_path, 'checkpoint_{:03d}.pth.tar'.format(epoch + 1))
+            shutil.copyfile(checkpoint_path, history_path)
 
 def train_seg(args):
     batch_size = args.batch_size
@@ -606,7 +744,7 @@ def test(eval_data_loader, model, num_classes,
                     'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                     .format(iter, len(eval_data_loader), batch_time=batch_time,
                             data_time=data_time))
-
+        st()
     # from pdb import set_trace as st
     # st()
     if has_gt: #val
@@ -616,7 +754,7 @@ def test(eval_data_loader, model, num_classes,
 
 def measureRFSize(model, image, t_patch_pos, t_patch_size, t_rec,thres = 0):
     # measure receptive field size of the model empirically
-    
+
     # measuring receptive field
     height, width = image.cpu().numpy().shape[2:]
 
@@ -649,7 +787,7 @@ def measureRFSize(model, image, t_patch_pos, t_patch_size, t_rec,thres = 0):
 
 def measureRFSize_pt(model, image, label, target_mask,thres = 0):
     # measure receptive field size of the model empirically
-    
+
     # measuring receptive field
     height, width = image.cpu().numpy().shape[2:]
 
@@ -693,7 +831,7 @@ def measureRFSize_pt(model, image, label, target_mask,thres = 0):
 
     return h,w,coord_mask,pt_wise_mask
 
-def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1):
+def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1, beta = 2.):
     images = image.cuda()
     t_labels = torch.ones_like(label)
     # t_labels = torch.zeros_like(label)
@@ -733,14 +871,14 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
     # eps *= 1.7585+3.8802
 
     restarts = 1
-    
+
     for j in range(restarts):
         delta = torch.rand_like(images, requires_grad=True)
         # delta = torch.zeros_like(images, requires_grad=True)
         delta.data = (delta.data * 2 * eps - eps) * perturb_mask
 
-        for i in range(iters) :  
-            step_size  = np.max([1e-3, step_size * 0.99])  
+        for i in range(iters) :
+            step_size  = np.max([1e-3, step_size * 0.99])
             images.requires_grad = False
             delta.requires_grad = True
             outputs = model((torch.clamp(((images*std+mean)+delta),min=0, max=1)- mean)/std)[0]
@@ -757,14 +895,14 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
 
             # mixed attack
             # cost = -loss(outputs*target_mask, labels*2*target_mask) - loss(outputs*target_mask, labels*0*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
-            
-            print(loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask).data, loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask).data, loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:]).data)
+
+            # print(loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask).data, loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask).data, loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:]).data)
             cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
             # cost = - 3*loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
             # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
 
             cost.backward()
-            print(i,cost)
+            # print(i,cost)
 
             adv_images = (images*std+mean) + delta + step_size*eps*delta.grad.sign() * perturb_mask
             eta = torch.clamp(adv_images - ori_images, min=-eps, max=eps)
@@ -774,7 +912,7 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
             if cost.cpu().data.numpy() > best_adv_img[1]:
                 best_adv_img = [delta.data, cost.cpu().data.numpy()]
 
-            
+
     return (torch.clamp(((images*std+mean)+best_adv_img[0]),min=0, max=1)- mean)/std
 
 def cw(model, image, label, target_mask, perturb_mask, step_size = 0.05, eps=10/255., iters=10, alpha = 0.1):
@@ -808,8 +946,8 @@ def cw(model, image, label, target_mask, perturb_mask, step_size = 0.05, eps=10/
     # eps *= 1.7585+3.8802
 
     h_loss = houdini_loss()
-        
-    for i in range(iters) :    
+
+    for i in range(iters) :
         images.requires_grad = True
         outputs = model(images)[0]
 
@@ -830,7 +968,7 @@ def cw(model, image, label, target_mask, perturb_mask, step_size = 0.05, eps=10/
         if cost.cpu().data.numpy() > best_adv_img[1]:
             best_adv_img = [images.data, cost.cpu().data.numpy()]
 
-            
+
     return best_adv_img[0]
 
 class houdini_loss(nn.Module):
@@ -872,13 +1010,17 @@ class houdini_loss(nn.Module):
         return torch.mean(mask * twod_cross_entropy)
 
 def attack(attack_data_loader, model, num_classes,
-         output_dir='pred', has_gt=True, save_vis=False):
+         output_dir='pred', has_gt=True, save_vis=False, pgd_steps = 0, use_crf=False):
     model.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
     hist = np.zeros((num_classes, num_classes))
     t_hist = hist.copy()
+    ttl_mAP = 0.
+    hist_crf = np.zeros((num_classes, num_classes))
+    t_hist_crf = hist_crf.copy()
+    ttl_mAP_crf = 0.
     for iter, (image, label, name) in enumerate(attack_data_loader):
         data_time.update(time.time() - end)
 
@@ -905,7 +1047,7 @@ def attack(attack_data_loader, model, num_classes,
             patch_rec[0][0]:patch_rec[1][0]] = 1
         perturb_mask = perturb_mask.astype(np.int8)
 
-        # adding perturb area to target as well 
+        # adding perturb area to target as well
         # to avoid spoofing new obstacle at the attack perturbation area
         loss_mask = target_mask.copy()
         # loss_mask[:,patch_rec[0][1]:patch_rec[1][1],
@@ -913,7 +1055,7 @@ def attack(attack_data_loader, model, num_classes,
 
         # measure receptive field
         rf_h, rf_w, rf_mask, rf_mask_bit = measureRFSize_pt(model, image, label, target_mask, thres = 1.)
-        print('receptive size: ',rf_h, rf_w)
+        # print('receptive size: ',rf_h, rf_w)
 
         # Tuning attack hyper params
         step_size_list = [0.1, 0.2, 0.5, 1.0]
@@ -926,22 +1068,73 @@ def attack(attack_data_loader, model, num_classes,
             for eps in eps_list:
                 print('eps: ', eps)
 
-                adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=50, alpha=1)
-                # adv_image = cw(model,image,label,loss_mask,perturb_mask, step_size = step_size, eps=eps, iters=200)
-                # adv_image = pgd(model,image,label,target_mask,perturb_mask, step_size = 0.2, eps=50./255, iters=50, targeted=False)
+                if pgd_steps == 0:
+                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
+                else:
+                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1)
 
                 image_var = Variable(adv_image)
-                final = model(image_var)[0]
+
+                # final : log softmax
+                # logits: logits
+                # middle: middle layers output
+
+                final, _, logits, middle = model(image_var)
                 _, pred = torch.max(final, 1)
                 pred = pred.cpu().data.numpy()
                 batch_time.update(time.time() - end)
+
+                adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+                adv_img *= 255
+
+                # CRF defense
+                d = dcrf.DenseCRF2D(2048, 1024, 19)  # width, height, nlabels
+                # U = unary_from_labels(pred[0].copy(), 19, gt_prob=0.7, zero_unsure=False)
+                # st()
+                probs = F.softmax(logits,dim = 1)
+                U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
+                d.setUnaryEnergy(U)
+
+                d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,
+                          normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+                # This adds the color-dependent term, i.e. features are (x,y,r,g,b).
+                d_img = np.ascontiguousarray(np.moveaxis(adv_img[0].astype(np.uint8),0,-1))
+
+                # d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
+                #                     compat=10,
+                #                     kernel=dcrf.DIAG_KERNEL,
+                #                     normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+                target_middle_layer_idx = 8
+                middle_layer_output = middle[target_middle_layer_idx]
+                # scaled_middle_layer = F.interpolate(middle_layer_output, size=adv_img.shape[2:], mode="bilinear", align_corners=True)
+                scaled_middle_layer = model.module.up(model.module.seg(middle_layer_output))
+                # scaled_middle_layer = scaled_middle_layer.cpu().data.numpy()
+                pred_middle = F.softmax(scaled_middle_layer,dim=1)
+                _, pred_middle = torch.max(pred_middle,1)
+                pred_middle = pred_middle.cpu().data.numpy()
+                save_colorful_images(pred_middle, ('test.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+                # scaled_middle_layer = np.ascontiguousarray(np.moveaxis(scaled_middle_layer[0].astype(np.uint8),0,-1))
+                # add miggle layer constraints
+                # pairwise_energy = create_pairwise_bilateral(sdims=(10,10), schan=(0.01,), img=scaled_middle_layer, chdim=2)
+                # d.addPairwiseEnergy(pairwise_energy, compat=10)
+                st()
+                Q = d.inference(5)
+
+                # Find out the most probable class for each pixel.
+                pred_crf = np.argmax(Q, axis=0).reshape([1,1024,2048])
+
+                st()
+
                 if save_vis:
                     save_output_images(pred, name, output_dir)
-                    adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
-                    adv_img *= 255
                     save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
                     save_colorful_images(
                         pred, name, output_dir + '_color',
+                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+                    save_colorful_images(
+                        pred_crf, name, output_dir + '_color_CRF',
                         TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
                     # save_colorful_images_with_mask(
                     #     pred, name, output_dir + '_color_patch',
@@ -959,16 +1152,40 @@ def attack(attack_data_loader, model, num_classes,
                         rf_mask = rf_mask_bit)
                 if has_gt:
                     label_np = label.numpy()
-                    t_hist += fast_hist(pred[:,target_rec[0][1]:target_rec[1][1],
-                    target_rec[0][0]:target_rec[1][0]].flatten(), 
-                        label_np[:,target_rec[0][1]:target_rec[1][1],
-                    target_rec[0][0]:target_rec[1][0]].flatten(),19)
-                    hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
+                    # t_hist += fast_hist(pred[:,target_rec[0][1]:target_rec[1][1],
+                    # target_rec[0][0]:target_rec[1][0]].flatten(),
+                    #     label_np[:,target_rec[0][1]:target_rec[1][1],
+                    # target_rec[0][0]:target_rec[1][0]].flatten(),19)
 
-                    logger.info('===> mAP {mAP:.3f}'.format(
-                        mAP=round(np.nanmean(per_class_iu(t_hist)) * 100, 2)))
-                    # logger.info('===> mAP {mAP:.3f}'.format(
-                    #     mAP=round(np.nanmean(per_class_iu(hist)) * 100, 2)))
+                    # changing all other labels to -1
+                    cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+                    t_hist += cur_hist
+                    hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
+                    idx_list = [6,7,13]
+                    cur_mAP = np.nanmean(per_class_iu(cur_hist)[idx_list]) * 100
+
+                    if math.isnan(cur_mAP):
+                        ttl_mAP += ttl_mAP/iter
+                        # st()
+                    else:
+                        ttl_mAP += cur_mAP
+                    logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                        mAP=round(cur_mAP,2),
+                        avg_mAP=round(ttl_mAP/(iter+1))))
+                     # CRF map
+                    cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+                    t_hist_crf += cur_hist_crf
+                    hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
+                    idx_list = [6,7,13]
+                    cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
+                    if math.isnan(cur_mAP_crf):
+                        ttl_mAP_crf += ttl_mAP_crf/iter
+                        # st()
+                    else:
+                        ttl_mAP_crf += cur_mAP_crf
+                    logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                        mAP=round(cur_mAP_crf,2),
+                        avg_mAP=round(ttl_mAP_crf/(iter+1))))
                 end = time.time()
                 st()
                 logger.info('Eval: [{0}/{1}]\t'
@@ -1203,7 +1420,7 @@ def attack_seg(args):
         # from pdb import set_trace as st
         # st()
         mAP = attack(test_loader, model, args.classes, save_vis=True,
-                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir)
+                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps = args.pgd_steps)
     logger.info('mAP: %f', mAP)
 
 def parse_args():
@@ -1239,6 +1456,8 @@ def parse_args():
                         help='use pre-trained model')
     parser.add_argument('--save_path', default='', type=str, metavar='PATH',
                         help='output path for training checkpoints')
+    parser.add_argument('--log_path', default='', type=str, metavar='PATH',
+                        help='log path for saving log')
     parser.add_argument('--save_iter', default=1, type=int,
                         help='number of training iterations between'
                              'checkpoint history saves')
@@ -1252,6 +1471,7 @@ def parse_args():
                         help='Turn on multi-scale testing')
     parser.add_argument('--with-gt', action='store_true')
     parser.add_argument('--test-suffix', default='', type=str)
+    parser.add_argument('--pgd-steps', default=0, type=int)
     args = parser.parse_args()
 
     assert args.classes > 0
@@ -1267,6 +1487,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    FORMAT = "[%(asctime)-15s %(filename)s:%(lineno)d %(funcName)s] %(message)s"
+    logging.basicConfig(filename=args.log_path, filemode='w',format=FORMAT)
+    global logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
     if args.cmd == 'train':
         train_seg(args)
     elif args.cmd == 'test':

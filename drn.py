@@ -4,6 +4,8 @@ import torch.nn as nn
 import math
 import torch.utils.model_zoo as model_zoo
 
+from pdb import set_trace as st
+
 BatchNorm = nn.BatchNorm2d
 
 
@@ -252,6 +254,8 @@ class DRN(nn.Module):
             x = self.avgpool(x)
             x = self.fc(x)
             x = x.view(x.size(0), -1)
+
+        st()
 
         if self.out_middle:
             return x, y
@@ -553,6 +557,12 @@ def drn_d_40(pretrained=False, **kwargs):
 
 def drn_d_54(pretrained=False, **kwargs):
     model = DRN(Bottleneck, [1, 1, 3, 4, 6, 3, 1, 1], arch='D', **kwargs)
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url(model_urls['drn-d-54']))
+    return model
+
+def resnet_54(pretrained=False, **kwargs):
+    model = ResNet(Bottleneck, [1, 1, 3, 4, 6, 3, 1, 1], arch='D', **kwargs)
     if pretrained:
         model.load_state_dict(model_zoo.load_url(model_urls['drn-d-54']))
     return model

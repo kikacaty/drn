@@ -1,8 +1,11 @@
 drn_d_22_000*
 datasets/cityscape/gtFine
 .vscode
-drn_d_22*
-resnet_d_22*
+drn_d_*
+resnet_d_*
 test*
 *.pth.tar
 __pycache__
+models/*
+log/*
+figs/*
