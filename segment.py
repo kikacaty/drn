@@ -1224,10 +1224,11 @@ def attack_seg(args):
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
-    if not os.path.exists(args.output_path):
-        os.makedirs(args.output_path)
+    output_path = '{}_{}_step_{}_evalnum_{}'.format(args.output_path, args.arch, args.pgd_steps, args.eval_num)
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
     out_dir = '{}_{:03d}_{}_attack'.format(args.arch, start_epoch, phase)
-    out_dir = os.path.join(args.output_path, out_dir)
+    out_dir = os.path.join(output_path, out_dir)
     if len(args.test_suffix) > 0:
         out_dir += '_' + args.test_suffix
     if args.ms:
