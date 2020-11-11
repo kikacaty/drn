@@ -1224,7 +1224,10 @@ def attack_seg(args):
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
+    if not os.path.exists(args.output_path):
+        os.makedirs(args.output_path)
     out_dir = '{}_{:03d}_{}_attack'.format(args.arch, start_epoch, phase)
+    out_dir = os.path.join(args.output_path, out_dir)
     if len(args.test_suffix) > 0:
         out_dir += '_' + args.test_suffix
     if args.ms:
@@ -1275,8 +1278,10 @@ def parse_args():
                         help='use pre-trained model')
     parser.add_argument('--save_path', default='', type=str, metavar='PATH',
                         help='output path for training checkpoints')
-    parser.add_argument('--log_path', default='', type=str, metavar='PATH',
+    parser.add_argument('--log_dir', default='', type=str, metavar='PATH',
                         help='log path for saving log')
+    parser.add_argument('--output_path', default='', type=str, metavar='PATH',
+                        help='output path for saving output image')
     parser.add_argument('--save_iter', default=1, type=int,
                         help='number of training iterations between'
                              'checkpoint history saves')
@@ -1308,7 +1313,11 @@ def parse_args():
 def main():
     args = parse_args()
     FORMAT = "[%(asctime)-15s %(filename)s:%(lineno)d %(funcName)s] %(message)s"
-    logging.basicConfig(filename=args.log_path, filemode='w',format=FORMAT)
+    if not os.path.exists(args.log_dir):
+        os.makedirs(args.log_dir,exist_ok=True)
+    log_filename = '{}_step_{}_evalnum_{}.log'.format(args.arch, args.pgd_steps, args.eval_num)
+    log_path = os.path.join(args.log_dir,log_filename)
+    logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
     global logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
