@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 import argparse
 import json
 import logging
@@ -33,7 +32,7 @@ import data_transforms as transforms
 import duc_hdc
 
 from pdb import set_trace as st
-from gpu_profile import gpu_profile
+#from gpu_profile import gpu_profile
 try:
     from modules import batchnormsync
 except ImportError:
@@ -154,6 +153,7 @@ class SegList(torch.utils.data.Dataset):
     def read_lists(self):
         image_path = join(self.list_dir, self.phase + '_images.txt')
         label_path = join(self.list_dir, self.phase + '_labels.txt')
+        print(image_path)
         assert exists(image_path)
         self.image_list = [line.strip() for line in open(image_path, 'r')]
         if exists(label_path):
@@ -954,7 +954,7 @@ def attack(attack_data_loader, model, num_classes,
                     image_var = Variable(adv_image)
                     final = model(image_var)[0]
 
-                    gpu_profile(frame=sys._getframe(), event='line', arg=None)
+                    #gpu_profile(frame=sys._getframe(), event='line', arg=None)
                     _, pred_t = torch.max(final, 1)
                     pred = pred_t.cpu().data.numpy()
                 batch_time.update(time.time() - end)
@@ -1003,7 +1003,7 @@ def attack(attack_data_loader, model, num_classes,
                         avg_mAP=round(ttl_mAP/(iter+1))))
                 end = time.time()
                 # st()
-                gpu_profile(frame=sys._getframe(), event='line', arg=None)
+                #gpu_profile(frame=sys._getframe(), event='line', arg=None)
                 logger.info('Eval: [{0}/{1}]\t'
                             'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                             'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
@@ -1332,5 +1332,5 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.settrace(gpu_profile)
+    #sys.settrace(gpu_profile)
     main()
