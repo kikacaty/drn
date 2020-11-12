@@ -81,22 +81,12 @@ def fill_up_weights(up):
     for c in range(1, w.size(0)):
         w[c, 0, :, :] = w[0, 0, :, :]
 
-class DRNSegCRF(nn.Module):
+class CRF_helper(nn.Module):
     def __init__(self, model_name, classes, pretrained_model=None,
-                 pretrained=True, use_torch_up=False, base_model=None):
-        super(DRNSegCRF, self).__init__()
+                 pretrained=True, use_torch_up=False, drnseg=None):
+        super(CRF_helper, self).__init__()
 
-        self.drnseg
-        # self.drnseg = DRNSeg(model_name, classes, pretrained_model=pretrained_model,
-        #                      pretrained=pretrained, use_torch_up=use_torch_up)
-        
-        # if os.path.isfile(base_model):
-        #     print("=> loading checkpoint '{}'".format(base_model))
-        #     st()
-        #     checkpoint = torch.load(base_model)
-        #     self.drnseg.load_state_dict(checkpoint['state_dict'])
-        # else:
-        #     print("=> no checkpoint found at '{}'".format(base_model))
+        self.drnseg = drnseg
 
         channels = [3, 16, 32, 64, 128, 256, 512, 512, 512]
         self.target_middle_layer_idx = 5
@@ -131,6 +121,54 @@ class DRNSegCRF(nn.Module):
         for param in self.seg.parameters():
             yield param
 
+class DRNSegCRF(nn.Module):
+    def __init__(self, model_name, classes, pretrained_model=None,
+                 pretrained=True, use_torch_up=False, base_model=None):
+        super(DRNSegCRF, self).__init__()
+
+        self.drnseg = DRNSeg(model_name, classes, pretrained_model=pretrained_model,
+                             pretrained=pretrained, use_torch_up=use_torch_up)
+        
+        if os.path.isfile(base_model):
+            print("=> loading checkpoint '{}'".format(base_model))
+            st()
+            checkpoint = torch.load(base_model)
+            self.drnseg.load_state_dict(checkpoint['state_dict'])
+        else:
+            print("=> no checkpoint found at '{}'".format(base_model))
+
+        channels = [3, 16, 32, 64, 128, 256, 512, 512, 512]
+        self.target_middle_layer_idx = 5
+
+        self.seg = nn.Conv2d(channels[self.target_middle_layer_idx], classes,
+                             kernel_size=1, bias=True)
+        self.softmax = nn.LogSoftmax()
+        m = self.seg
+        n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+        m.weight.data.normal_(0, math.sqrt(2. / n))
+        m.bias.data.zero_()
+        if use_torch_up:
+            self.up = nn.UpsamplingBilinear2d(scale_factor=8)
+        else:
+            up = nn.ConvTranspose2d(classes, classes, 16, stride=8, padding=4,
+                                    output_padding=0, groups=classes,
+                                    bias=False)
+            fill_up_weights(up)
+            up.weight.requires_grad = False
+            self.up = up
+
+    def forward(self, x):
+        middle = self.drnseg(x)[-1]
+        middle_layer_output = middle[self.target_middle_layer_idx]
+        x = self.seg(middle_layer_output)
+        y = self.up(x)
+        return self.softmax(y), x, y, middle
+
+    def optim_parameters(self, memo=None):
+        # for param in self.base.parameters():
+        #     yield param
+        for param in self.seg.parameters():
+            yield param
 
 class DRNSeg(nn.Module):
     def __init__(self, model_name, classes, pretrained_model=None,
@@ -404,11 +442,22 @@ def train_seg_crf(args):
     for k, v in args.__dict__.items():
         print(k, ':', v)
 
-    single_model = DRNSegCRF(args.arch, args.classes, None,
-                          pretrained=True, base_model=args.base_model)
+    single_drnseg = DRNSeg(args.arch, args.classes, None,
+                          pretrained=True)
     if args.pretrained:
-        single_model.load_state_dict(torch.load(args.pretrained))
-    model = torch.nn.DataParallel(single_model).cuda()
+        single_drnseg.load_state_dict(torch.load(args.pretrained))
+    drnseg = torch.nn.DataParallel(single_drnseg).cuda()
+    if os.path.isfile(args.base_model):
+        print("=> loading checkpoint '{}'".format(args.base_model))
+        checkpoint = torch.load(args.base_model)
+        drnseg.load_state_dict(checkpoint['state_dict'])
+    else:
+        print("=> no checkpoint found at '{}'".format(args.base_model))
+
+    single_crf_model = CRF_helper(args.arch, args.classes, None,
+                          pretrained=True, drnseg=drnseg)
+
+    crf_model = torch.nn.DataParallel(single_crf_model).cuda()
     criterion = nn.NLLLoss2d(ignore_index=255)
 
     criterion.cuda()
@@ -444,7 +493,7 @@ def train_seg_crf(args):
     )
 
     # define loss function (criterion) and pptimizer
-    optimizer = torch.optim.SGD(single_model.optim_parameters(),
+    optimizer = torch.optim.SGD(single_crf_model.optim_parameters(),
                                 args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -460,25 +509,25 @@ def train_seg_crf(args):
             checkpoint = torch.load(args.resume)
             start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
-            model.load_state_dict(checkpoint['state_dict'])
+            crf_model.load_state_dict(checkpoint['state_dict'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     if args.evaluate:
-        validate(val_loader, model, criterion, eval_score=accuracy)
+        validate(val_loader, crf_model, criterion, eval_score=accuracy)
         return
 
     for epoch in range(start_epoch, args.epochs):
         lr = adjust_learning_rate(args, optimizer, epoch)
         logger.info('Epoch: [{0}]\tlr {1:.06f}'.format(epoch, lr))
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch,
+        train(train_loader, crf_model, criterion, optimizer, epoch,
               eval_score=accuracy)
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion, eval_score=accuracy)
+        prec1 = validate(val_loader, crf_model, criterion, eval_score=accuracy)
 
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
@@ -488,7 +537,7 @@ def train_seg_crf(args):
         save_checkpoint({
             'epoch': epoch + 1,
             'arch': args.arch,
-            'state_dict': model.state_dict(),
+            'state_dict': crf_model.state_dict(),
             'best_prec1': best_prec1,
         }, is_best, filename=checkpoint_path)
         if (epoch + 1) % args.save_iter == 0:
@@ -846,7 +895,7 @@ def measureRFSize_pt(model, image, label, target_mask,thres = 0):
 
     return h,w,coord_mask,pt_wise_mask
 
-def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1, beta = 2.):
+def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1, beta = 2., restarts=1):
     images = image.cuda()
     t_labels = torch.ones_like(label)
     # t_labels = torch.zeros_like(label)
@@ -885,7 +934,7 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
     # scaling the attack eps
     # eps *= 1.7585+3.8802
 
-    restarts = 1
+    # restarts = 5
 
     for j in range(restarts):
         delta = torch.rand_like(images, requires_grad=True)
@@ -1025,8 +1074,9 @@ class houdini_loss(nn.Module):
         return torch.mean(mask * twod_cross_entropy)
 
 def attack(attack_data_loader, model, num_classes,
-         output_dir='pred', has_gt=True, save_vis=False, pgd_steps = 0, use_crf=False):
+         output_dir='pred', has_gt=True, save_vis=False, pgd_steps = 0, crf_model = None):
     model.eval()
+    crf_model.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -1086,7 +1136,7 @@ def attack(attack_data_loader, model, num_classes,
                 if pgd_steps == 0:
                     adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
                 else:
-                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1)
+                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5)
 
                 image_var = Variable(adv_image)
 
@@ -1104,43 +1154,45 @@ def attack(attack_data_loader, model, num_classes,
 
                 # CRF defense
                 d = dcrf.DenseCRF2D(2048, 1024, 19)  # width, height, nlabels
+                final_crf, _, logits_crf, middle_crf = crf_model(image_var)
                 # U = unary_from_labels(pred[0].copy(), 19, gt_prob=0.7, zero_unsure=False)
-                st()
+                # probs = F.softmax(logits_crf,dim = 1)
                 probs = F.softmax(logits,dim = 1)
                 U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
-                d.setUnaryEnergy(U)
+                d.setUnaryEnergy(U) 
+                _, pred_crf = torch.max(logits_crf, 1)
+                logits_img = pred_crf.cpu().data.numpy().copy()
+                pairwise_energy = create_pairwise_bilateral(sdims=(10,10), schan=(0.1,), img=logits_img, chdim=0)
+                # d.addPairwiseEnergy(pairwise_energy, compat=50) 
 
-                d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,
-                          normalization=dcrf.NORMALIZE_SYMMETRIC)
+                # d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,normalization=dcrf.NORMALIZE_SYMMETRIC)
 
                 # This adds the color-dependent term, i.e. features are (x,y,r,g,b).
                 d_img = np.ascontiguousarray(np.moveaxis(adv_img[0].astype(np.uint8),0,-1))
 
-                # d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
-                #                     compat=10,
-                #                     kernel=dcrf.DIAG_KERNEL,
-                #                     normalization=dcrf.NORMALIZE_SYMMETRIC)
+                d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
+                                    compat=10,
+                                    kernel=dcrf.DIAG_KERNEL,
+                                    normalization=dcrf.NORMALIZE_SYMMETRIC)
 
-                target_middle_layer_idx = 8
-                middle_layer_output = middle[target_middle_layer_idx]
+                # target_middle_layer_idx = 8
+                # middle_layer_output = middle[target_middle_layer_idx]
                 # scaled_middle_layer = F.interpolate(middle_layer_output, size=adv_img.shape[2:], mode="bilinear", align_corners=True)
-                scaled_middle_layer = model.module.up(model.module.seg(middle_layer_output))
+                # scaled_middle_layer = model.module.up(model.module.seg(middle_layer_output))
                 # scaled_middle_layer = scaled_middle_layer.cpu().data.numpy()
-                pred_middle = F.softmax(scaled_middle_layer,dim=1)
-                _, pred_middle = torch.max(pred_middle,1)
-                pred_middle = pred_middle.cpu().data.numpy()
-                save_colorful_images(pred_middle, ('test.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+                # pred_middle = F.softmax(scaled_middle_layer,dim=1)
+                # _, pred_middle = torch.max(pred_middle,1)
+                # pred_middle = pred_middle.cpu().data.numpy()
+                # save_colorful_images(pred_middle, ('test.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
                 # scaled_middle_layer = np.ascontiguousarray(np.moveaxis(scaled_middle_layer[0].astype(np.uint8),0,-1))
                 # add miggle layer constraints
                 # pairwise_energy = create_pairwise_bilateral(sdims=(10,10), schan=(0.01,), img=scaled_middle_layer, chdim=2)
                 # d.addPairwiseEnergy(pairwise_energy, compat=10)
-                st()
-                Q = d.inference(5)
+                Q = d.inference(10)
 
                 # Find out the most probable class for each pixel.
                 pred_crf = np.argmax(Q, axis=0).reshape([1,1024,2048])
-
-                st()
+                # save_colorful_images(pred_crf, name, output_dir + '_color_CRF',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
 
                 if save_vis:
                     save_output_images(pred, name, output_dir)
@@ -1202,7 +1254,7 @@ def attack(attack_data_loader, model, num_classes,
                         mAP=round(cur_mAP_crf,2),
                         avg_mAP=round(ttl_mAP_crf/(iter+1))))
                 end = time.time()
-                st()
+                # st()
                 logger.info('Eval: [{0}/{1}]\t'
                             'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                             'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
@@ -1378,11 +1430,7 @@ def attack_seg(args):
     for k, v in args.__dict__.items():
         print(k, ':', v)
 
-    if args.crf_model:
-        single_model = DRNSegCRF(args.arch, args.classes, pretrained_model=None,
-                          pretrained=False,base_model=args.resume)
-    else:
-        single_model = DRNSeg(args.arch, args.classes, pretrained_model=None,
+    single_model = DRNSeg(args.arch, args.classes, pretrained_model=None,
                           pretrained=False)
     if args.pretrained:
         single_model.load_state_dict(torch.load(args.pretrained))
@@ -1412,18 +1460,7 @@ def attack_seg(args):
 
     # optionally resume from a checkpoint
     start_epoch = 0
-    if args.crf_model:
-        if os.path.isfile(args.crf_model):
-            logger.info("=> loading checkpoint '{}'".format(args.crf_model))
-            checkpoint = torch.load(args.crf_model)
-            start_epoch = checkpoint['epoch']
-            best_prec1 = checkpoint['best_prec1']
-            model.load_state_dict(checkpoint['state_dict'])
-            logger.info("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.crf_model, checkpoint['epoch']))
-        else:
-            logger.info("=> no checkpoint found at '{}'".format(args.crf_model))
-    elif args.resume:
+    if args.resume:
         if os.path.isfile(args.resume):
             logger.info("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
@@ -1434,6 +1471,22 @@ def attack_seg(args):
                   .format(args.resume, checkpoint['epoch']))
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
+
+    # crf model
+    if args.crf_model:
+        single_crf_model = CRF_helper(args.arch, args.classes, pretrained_model=None,
+                          pretrained=False,drnseg=model)
+        crf_model = torch.nn.DataParallel(single_crf_model).cuda()
+        if os.path.isfile(args.crf_model):
+            logger.info("=> loading checkpoint '{}'".format(args.crf_model))
+            checkpoint = torch.load(args.crf_model)
+            crf_model.load_state_dict(checkpoint['state_dict'])
+            logger.info("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.crf_model, checkpoint['epoch']))
+        else:
+            logger.info("=> no checkpoint found at '{}'".format(args.crf_model))
+    else:
+        crf_model = None
 
     out_dir = '{}_{:03d}_{}_attack'.format(args.arch, start_epoch, phase)
     if len(args.test_suffix) > 0:
@@ -1450,7 +1503,8 @@ def attack_seg(args):
         # from pdb import set_trace as st
         # st()
         mAP = attack(test_loader, model, args.classes, save_vis=True,
-                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps = args.pgd_steps)
+                   has_gt=(phase != 'test' or args.with_gt), 
+                   output_dir=out_dir, pgd_steps = args.pgd_steps, crf_model=crf_model)
     logger.info('mAP: %f', mAP)
 
 def parse_args():
