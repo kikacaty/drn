@@ -83,13 +83,25 @@ def fill_up_weights(up):
 
 class DRNSegCRF(nn.Module):
     def __init__(self, model_name, classes, pretrained_model=None,
-                 pretrained=True, use_torch_up=False):
+                 pretrained=True, use_torch_up=False, base_model=None):
         super(DRNSegCRF, self).__init__()
 
-        self.drnseg = DRNSeg(model_name, classes, pretrained_model=pretrained_model,
-                             pretrained=pretrained, use_torch_up=use_torch_up)
+        self.drnseg
+        # self.drnseg = DRNSeg(model_name, classes, pretrained_model=pretrained_model,
+        #                      pretrained=pretrained, use_torch_up=use_torch_up)
+        
+        # if os.path.isfile(base_model):
+        #     print("=> loading checkpoint '{}'".format(base_model))
+        #     st()
+        #     checkpoint = torch.load(base_model)
+        #     self.drnseg.load_state_dict(checkpoint['state_dict'])
+        # else:
+        #     print("=> no checkpoint found at '{}'".format(base_model))
 
-        self.seg = nn.Conv2d(model.out_dim, classes,
+        channels = [3, 16, 32, 64, 128, 256, 512, 512, 512]
+        self.target_middle_layer_idx = 5
+
+        self.seg = nn.Conv2d(channels[self.target_middle_layer_idx], classes,
                              kernel_size=1, bias=True)
         self.softmax = nn.LogSoftmax()
         m = self.seg
@@ -107,11 +119,15 @@ class DRNSegCRF(nn.Module):
             self.up = up
 
     def forward(self, x):
-        return self.drnseg(x)
+        middle = self.drnseg(x)[-1]
+        middle_layer_output = middle[self.target_middle_layer_idx]
+        x = self.seg(middle_layer_output)
+        y = self.up(x)
+        return self.softmax(y), x, y, middle
 
     def optim_parameters(self, memo=None):
-        for param in self.base.parameters():
-            yield param
+        # for param in self.base.parameters():
+        #     yield param
         for param in self.seg.parameters():
             yield param
 
@@ -343,7 +359,6 @@ def train(train_loader, model, criterion, optimizer, epoch,
         target_var = torch.autograd.Variable(target)
 
         # compute output
-        st()
         output = model(input_var)[0]
         loss = criterion(output, target_var)
 
@@ -389,8 +404,8 @@ def train_seg_crf(args):
     for k, v in args.__dict__.items():
         print(k, ':', v)
 
-    single_model = DRNSeg(args.arch, args.classes, None,
-                          pretrained=True)
+    single_model = DRNSegCRF(args.arch, args.classes, None,
+                          pretrained=True, base_model=args.base_model)
     if args.pretrained:
         single_model.load_state_dict(torch.load(args.pretrained))
     model = torch.nn.DataParallel(single_model).cuda()
@@ -1090,7 +1105,7 @@ def attack(attack_data_loader, model, num_classes,
                 # CRF defense
                 d = dcrf.DenseCRF2D(2048, 1024, 19)  # width, height, nlabels
                 # U = unary_from_labels(pred[0].copy(), 19, gt_prob=0.7, zero_unsure=False)
-                # st()
+                st()
                 probs = F.softmax(logits,dim = 1)
                 U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
                 d.setUnaryEnergy(U)
@@ -1363,7 +1378,11 @@ def attack_seg(args):
     for k, v in args.__dict__.items():
         print(k, ':', v)
 
-    single_model = DRNSeg(args.arch, args.classes, pretrained_model=None,
+    if args.crf_model:
+        single_model = DRNSegCRF(args.arch, args.classes, pretrained_model=None,
+                          pretrained=False,base_model=args.resume)
+    else:
+        single_model = DRNSeg(args.arch, args.classes, pretrained_model=None,
                           pretrained=False)
     if args.pretrained:
         single_model.load_state_dict(torch.load(args.pretrained))
@@ -1393,7 +1412,18 @@ def attack_seg(args):
 
     # optionally resume from a checkpoint
     start_epoch = 0
-    if args.resume:
+    if args.crf_model:
+        if os.path.isfile(args.crf_model):
+            logger.info("=> loading checkpoint '{}'".format(args.crf_model))
+            checkpoint = torch.load(args.crf_model)
+            start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            logger.info("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.crf_model, checkpoint['epoch']))
+        else:
+            logger.info("=> no checkpoint found at '{}'".format(args.crf_model))
+    elif args.resume:
         if os.path.isfile(args.resume):
             logger.info("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
@@ -1426,7 +1456,7 @@ def attack_seg(args):
 def parse_args():
     # Training settings
     parser = argparse.ArgumentParser(description='')
-    parser.add_argument('cmd', choices=['train', 'test', 'attack'])
+    parser.add_argument('cmd', choices=['train', 'test', 'attack', 'train_crf'])
     parser.add_argument('-d', '--data-dir', default=None, required=True)
     parser.add_argument('-l', '--list-dir', default=None,
                         help='List dir to look for train_images.txt etc. '
@@ -1451,6 +1481,10 @@ def parse_args():
                         help='evaluate model on validation set')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
+    parser.add_argument('--base_model', default='', type=str, metavar='PATH',
+                        help='path to base model checkpoint (default: none)')
+    parser.add_argument('--crf_model', default='', type=str, metavar='PATH',
+                        help='path to crf model checkpoint (default: none)')
     parser.add_argument('--pretrained', dest='pretrained',
                         default='', type=str, metavar='PATH',
                         help='use pre-trained model')
@@ -1499,6 +1533,8 @@ def main():
         test_seg(args)
     elif args.cmd == 'attack':
         attack_seg(args)
+    elif args.cmd == 'train_crf':
+        train_seg_crf(args)
 
 
 if __name__ == '__main__':
