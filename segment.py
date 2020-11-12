@@ -883,7 +883,7 @@ class houdini_loss(nn.Module):
         return torch.mean(mask * twod_cross_entropy)
 
 def attack(attack_data_loader, model, num_classes,
-         output_dir='pred', has_gt=True, save_vis=False, pgd_steps=0, eval_num = 100):
+         output_dir='pred', has_gt=True, save_vis=False, pgd_steps=0, eval_num = 100,patch_dist = 0):
     model.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -899,7 +899,7 @@ def attack(attack_data_loader, model, num_classes,
         patch_size = (50,300)
         target_size = 300
         patch_pos = (450,1100)
-        patch_pos = (520,1100)
+        patch_pos = (520+patch_dist,1100)
         patch_rec = ((patch_pos[1] - patch_size[1]//2, patch_pos[0] - patch_size[0]//2),
             (patch_pos[1] + patch_size[1]//2, patch_pos[0] + patch_size[0]//2))
         target_pos = (380,1100)
@@ -1224,7 +1224,7 @@ def attack_seg(args):
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
-    output_path = '{}_{}_step_{}_evalnum_{}'.format(args.output_path, args.arch, args.pgd_steps, args.eval_num)
+    output_path = '{}_{}_step_{}_evalnum_{}_dist_{}'.format(args.output_path, args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     out_dir = '{}_{:03d}_{}_attack'.format(args.arch, start_epoch, phase)
@@ -1243,7 +1243,7 @@ def attack_seg(args):
         # from pdb import set_trace as st
         # st()
         mAP = attack(test_loader, model, args.classes, save_vis=True,
-                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps=args.pgd_steps,eval_num=args.eval_num)
+                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps=args.pgd_steps,eval_num=args.eval_num,patch_dist=args.patch_dist)
     logger.info('mAP: %f', mAP)
 
 def parse_args():
@@ -1298,6 +1298,7 @@ def parse_args():
     parser.add_argument('--test-suffix', default='', type=str)
     parser.add_argument('--pgd-steps', default=0, type=int)
     parser.add_argument('--eval-num', default=100, type=int)
+    parser.add_argument('--patch-dist', default=0, type=int)
     args = parser.parse_args()
 
     assert args.classes > 0
