@@ -1317,7 +1317,7 @@ def main():
     FORMAT = "[%(asctime)-15s %(filename)s:%(lineno)d %(funcName)s] %(message)s"
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir,exist_ok=True)
-    log_filename = '{}_step_{}_evalnum_{}.log'.format(args.arch, args.pgd_steps, args.eval_num)
+    log_filename = '{}_step_{}_evalnum_{}_dist_{}.log'.format(args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
     log_path = os.path.join(args.log_dir,log_filename)
     logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
     global logger
