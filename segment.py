@@ -30,7 +30,7 @@ import data_transforms as transforms
 
 import pydensecrf.densecrf as dcrf
 from pydensecrf.utils import unary_from_labels, unary_from_softmax, create_pairwise_bilateral
-
+from scipy.ndimage.filters import gaussian_filter
 
 from pdb import set_trace as st
 
@@ -895,10 +895,9 @@ def measureRFSize_pt(model, image, label, target_mask,thres = 0):
 
     return h,w,coord_mask,pt_wise_mask
 
-def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1, beta = 2., restarts=1):
+def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1, beta = 2., restarts=1, target_label=None, rap=False):
     images = image.cuda()
     t_labels = torch.ones_like(label)
-    # t_labels = torch.zeros_like(label)
     labels = t_labels.cuda(async=True)
 
     u_labels = label.cuda(async=True)
@@ -931,23 +930,32 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
 
     ori_images = images.data * std + mean
 
-    # scaling the attack eps
-    # eps *= 1.7585+3.8802
-
-    # restarts = 5
-
     for j in range(restarts):
         delta = torch.rand_like(images, requires_grad=True)
         # delta = torch.zeros_like(images, requires_grad=True)
         delta.data = (delta.data * 2 * eps - eps) * perturb_mask
 
         for i in range(iters) :
+
+            start = time.time()
             step_size  = np.max([1e-3, step_size * 0.99])
             images.requires_grad = False
             delta.requires_grad = True
             outputs = model((torch.clamp(((images*std+mean)+delta),min=0, max=1)- mean)/std)[0]
 
             model.zero_grad()
+
+            # remove attack
+            cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+
+            # rap attack
+            if rap:
+                if target_label:
+                    # target attack
+                    cost = - loss(outputs*target_mask, labels*target_label*target_mask)
+                else:
+                    # untargeted attack
+                    cost = loss(outputs*target_mask, u_labels*target_mask)
 
             # targeted attack
             # cost = -loss(outputs*target_mask, labels*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
@@ -961,7 +969,7 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
             # cost = -loss(outputs*target_mask, labels*2*target_mask) - loss(outputs*target_mask, labels*0*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
 
             # print(loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask).data, loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask).data, loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:]).data)
-            cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+            # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
             # cost = - 3*loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
             # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
 
@@ -975,7 +983,6 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
 
             if cost.cpu().data.numpy() > best_adv_img[1]:
                 best_adv_img = [delta.data, cost.cpu().data.numpy()]
-
 
     return (torch.clamp(((images*std+mean)+best_adv_img[0]),min=0, max=1)- mean)/std
 
@@ -1073,10 +1080,19 @@ class houdini_loss(nn.Module):
         mask = 0.5 + 0.5 * (((pred_score-target_score)/math.sqrt(2)).erf())
         return torch.mean(mask * twod_cross_entropy)
 
-def attack(attack_data_loader, model, num_classes,
-         output_dir='pred', has_gt=True, save_vis=False, pgd_steps = 0, crf_model = None):
+# remote adversarial patch attack
+def attack_rap(attack_data_loader, model, num_classes,
+         output_dir='pred', has_gt=True, save_vis=False, 
+         pgd_steps = 0, crf_model = None,
+         eval_num = 100, patch_dist = 0):
+
+    target_labels = [
+            5,6,7, # object
+            11,12, # human
+            13,14,15,16,17,18 # vehicle    
+        ]
+
     model.eval()
-    crf_model.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -1086,7 +1102,11 @@ def attack(attack_data_loader, model, num_classes,
     hist_crf = np.zeros((num_classes, num_classes))
     t_hist_crf = hist_crf.copy()
     ttl_mAP_crf = 0.
+    eval_cnt = 0
     for iter, (image, label, name) in enumerate(attack_data_loader):
+        print('==> Attacking image [{}/{}]...'.format(eval_cnt,eval_num))
+        if eval_cnt >= eval_num:
+            break
         data_time.update(time.time() - end)
 
         height, width = image.shape[2:]
@@ -1094,7 +1114,7 @@ def attack(attack_data_loader, model, num_classes,
         patch_size = (50,300)
         target_size = 300
         patch_pos = (450,1100)
-        patch_pos = (520,1100)
+        patch_pos = (520+patch_dist,1100)
         patch_rec = ((patch_pos[1] - patch_size[1]//2, patch_pos[0] - patch_size[0]//2),
             (patch_pos[1] + patch_size[1]//2, patch_pos[0] + patch_size[0]//2))
         target_pos = (380,1100)
@@ -1107,7 +1127,184 @@ def attack(attack_data_loader, model, num_classes,
         perturb_mask = np.zeros_like(image)
         target_mask[:,target_rec[0][1]:target_rec[1][1],
             target_rec[0][0]:target_rec[1][0]] = 1
-        target_mask = (((label == 13) | (label == 6) | (label == 7)).numpy() & (target_mask ==1)).astype(np.int8) # traffic sign and car
+        target_mask = (np.any([label.numpy() == id for id in target_labels],axis = 0) & (target_mask == 1)).astype(np.int8) 
+
+        if target_mask.sum() == 0:
+            print('No target, skipping...')
+            continue
+
+        eval_cnt += 1
+        
+        perturb_mask[:,:,patch_rec[0][1]:patch_rec[1][1],
+            patch_rec[0][0]:patch_rec[1][0]] = 1
+        perturb_mask = perturb_mask.astype(np.int8)
+
+        # adding perturb area to target as well
+        # to avoid spoofing new obstacle at the attack perturbation area
+        loss_mask = target_mask.copy()
+        # loss_mask[:,patch_rec[0][1]:patch_rec[1][1],
+        #     patch_rec[0][0]:patch_rec[1][0]] = 1
+
+        # measure receptive field
+        rf_h, rf_w, rf_mask, rf_mask_bit = measureRFSize_pt(model, image, label, target_mask, thres = 1.)
+        # print('receptive size: ',rf_h, rf_w)
+
+        # Tuning attack hyper params
+        step_size_list = [0.1, 0.2, 0.5, 1.0]
+        step_size_list = [1.0]
+        eps_list = [10./255, 50./255, 100./255, 200./255]
+        eps_list = [1.]
+
+        step_size = 1.0
+        eps = 1.
+
+        # for step_size in step_size_list:
+        #     print('step size: ',step_size)
+        #     for eps in eps_list:
+        #         print('eps: ', eps)
+
+        if pgd_steps == 0:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
+        else:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, 
+            step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5, rap=True)
+
+        image_var = Variable(adv_image)
+
+        # final : log softmax
+        # logits: logits
+        # middle: middle layers output
+
+        final, final_x, logits, middle = model(image_var)
+        _, pred = torch.max(final, 1)
+        pred = pred.cpu().data.numpy()
+        batch_time.update(time.time() - end)
+
+        adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+        adv_img *= 255
+
+        if save_vis:
+            save_output_images(pred, name, output_dir)
+            save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
+            save_colorful_images(
+                pred, name, output_dir + '_color',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+            if crf_model:
+                save_colorful_images(
+                    pred_crf, name, output_dir + '_color_CRF',
+                    TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+            save_colorful_images_with_pointwise_mask(
+                pred, name, output_dir + '_color_patch',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
+                p_mask = perturb_mask,
+                t_mask = target_mask,
+                rf_mask = rf_mask_bit)
+        if has_gt:
+            label_np = label.numpy()
+            # changing all other labels to -1
+            cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+            t_hist += cur_hist
+            hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
+            # idx_list = [6,7,13]
+            # cur_mAP = np.nanmean(per_class_iu(cur_hist)[idx_list]) * 100
+            cur_mAP = np.nanmean(per_class_iu(cur_hist)) * 100
+
+            if math.isnan(cur_mAP):
+                ttl_mAP += ttl_mAP/iter
+                # st()
+            else:
+                ttl_mAP += cur_mAP
+            logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                mAP=round(cur_mAP,2),
+                avg_mAP=round(ttl_mAP/(iter+1))))
+                # CRF map
+            if crf_model:
+                cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+                t_hist_crf += cur_hist_crf
+                hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
+                idx_list = [6,7,13]
+                cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
+                if math.isnan(cur_mAP_crf):
+                    ttl_mAP_crf += ttl_mAP_crf/iter
+                    # st()
+                else:
+                    ttl_mAP_crf += cur_mAP_crf
+                logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                    mAP=round(cur_mAP_crf,2),
+                    avg_mAP=round(ttl_mAP_crf/(iter+1))))
+        end = time.time()
+        # st()
+        ious = per_class_iu(cur_hist) * 100
+        logger.info(' '.join('{:.03f}'.format(i) for i in ious))
+
+        logger.info('Eval: [{0}/{1}]\t'
+                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                    'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                    .format(iter, len(attack_data_loader), batch_time=batch_time,
+                            data_time=data_time))
+
+
+    if has_gt: #val
+        ious = per_class_iu(t_hist) * 100
+        logger.info(' '.join('{:.03f}'.format(i) for i in ious))
+        return round(np.nanmean(ious), 2)
+
+def attack(attack_data_loader, model, num_classes,
+         output_dir='pred', has_gt=True, save_vis=False, 
+         pgd_steps = 0, crf_model = None,
+         eval_num = 100, patch_dist = 0):
+
+    target_labels = [
+            5,6,7, # object
+            11,12, # human
+            13,14,15,16,17,18 # vehicle    
+        ]
+
+    model.eval()
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    end = time.time()
+    hist = np.zeros((num_classes, num_classes))
+    t_hist = hist.copy()
+    ttl_mAP = 0.
+    hist_crf = np.zeros((num_classes, num_classes))
+    t_hist_crf = hist_crf.copy()
+    ttl_mAP_crf = 0.
+    eval_cnt = 0
+    for iter, (image, label, name) in enumerate(attack_data_loader):
+        if eval_cnt >= eval_num:
+            break
+        print('==> Attacking image [{}/{}]...'.format(eval_cnt,eval_num))
+
+        data_time.update(time.time() - end)
+
+        height, width = image.shape[2:]
+
+        patch_size = (50,300)
+        target_size = 300
+        patch_pos = (450,1100)
+        patch_pos = (520+patch_dist,1100)
+        patch_rec = ((patch_pos[1] - patch_size[1]//2, patch_pos[0] - patch_size[0]//2),
+            (patch_pos[1] + patch_size[1]//2, patch_pos[0] + patch_size[0]//2))
+        target_pos = (380,1100)
+        # target_pos = (280,1100)
+        target_rec = ((target_pos[1] - target_size//2, target_pos[0] - target_size//2),
+            (target_pos[1] + target_size//2, target_pos[0] + target_size//2))
+
+        target_mask = np.zeros_like(label)
+        # target_mask = np.ones_like(label)
+        perturb_mask = np.zeros_like(image)
+        target_mask[:,target_rec[0][1]:target_rec[1][1],
+            target_rec[0][0]:target_rec[1][0]] = 1
+
+        target_mask = (np.any([label.numpy() == id for id in target_labels],axis = 0) & (target_mask == 1)).astype(np.int8) 
+        
+        if target_mask.sum() == 0:
+            print('No target, skipping...')
+            continue
+
+        eval_cnt += 1
+        
         perturb_mask[:,:,patch_rec[0][1]:patch_rec[1][1],
             patch_rec[0][0]:patch_rec[1][0]] = 1
         perturb_mask = perturb_mask.astype(np.int8)
@@ -1144,7 +1341,7 @@ def attack(attack_data_loader, model, num_classes,
                 # logits: logits
                 # middle: middle layers output
 
-                final, _, logits, middle = model(image_var)
+                final, final_x, logits, middle = model(image_var)
                 _, pred = torch.max(final, 1)
                 pred = pred.cpu().data.numpy()
                 batch_time.update(time.time() - end)
@@ -1152,47 +1349,110 @@ def attack(attack_data_loader, model, num_classes,
                 adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
                 adv_img *= 255
 
+                POS_W = 3
+                POS_XY_STD = 1
+                Bi_W = 4
+                Bi_XY_STD = 67
+                Bi_RGB_STD = 10
+                crf_iter = 10
+                CRF_W = 4
+                CRF_XY_STD = 67
+                CRF_CHAN_STD = 0.1
                 # CRF defense
-                d = dcrf.DenseCRF2D(2048, 1024, 19)  # width, height, nlabels
-                final_crf, _, logits_crf, middle_crf = crf_model(image_var)
-                # U = unary_from_labels(pred[0].copy(), 19, gt_prob=0.7, zero_unsure=False)
-                # probs = F.softmax(logits_crf,dim = 1)
-                probs = F.softmax(logits,dim = 1)
-                U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
-                d.setUnaryEnergy(U) 
-                _, pred_crf = torch.max(logits_crf, 1)
-                logits_img = pred_crf.cpu().data.numpy().copy()
-                pairwise_energy = create_pairwise_bilateral(sdims=(10,10), schan=(0.1,), img=logits_img, chdim=0)
-                # d.addPairwiseEnergy(pairwise_energy, compat=50) 
 
-                # d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,normalization=dcrf.NORMALIZE_SYMMETRIC)
+                def CRF_postprocess(
+                    POS_W = 3, 
+                    POS_XY_STD = 1,
+                    Bi_W = 4,
+                    Bi_XY_STD = 67,
+                    Bi_RGB_STD = 3,
+                    crf_iter = 10,
+                    CRF_W = 4,
+                    CRF_XY_STD = 67,
+                    CRF_CHAN_STD = 0.1,
+                    PRED_W = 3, smooth=3):
 
-                # This adds the color-dependent term, i.e. features are (x,y,r,g,b).
-                d_img = np.ascontiguousarray(np.moveaxis(adv_img[0].astype(np.uint8),0,-1))
+                    # for crf_iter in [1,5,10]:
+                    #     for CRF_W in [10]:
+                    #         for CRF_CHAN_STD in [0.01]:
+                    crf_model.eval()
 
-                d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
-                                    compat=10,
-                                    kernel=dcrf.DIAG_KERNEL,
-                                    normalization=dcrf.NORMALIZE_SYMMETRIC)
+                    print('Iter: {}, weight: {}, crf_chan_std: {}'.format(crf_iter, CRF_W, CRF_CHAN_STD))
+                    d = dcrf.DenseCRF2D(256, 128, 19)  # width, height, nlabels
+                    final_crf, final_crf_x, logits_crf, middle_crf = crf_model(image_var)
+                    resized_image = F.interpolate(image_var, size=final_crf_x.shape[2:], mode="bilinear", align_corners=True)
+                    normalized_final_x = (final_x - final_x.mean())/final_x.std()
+                    probs = F.softmax(normalized_final_x, dim = 1)
 
-                # target_middle_layer_idx = 8
-                # middle_layer_output = middle[target_middle_layer_idx]
-                # scaled_middle_layer = F.interpolate(middle_layer_output, size=adv_img.shape[2:], mode="bilinear", align_corners=True)
-                # scaled_middle_layer = model.module.up(model.module.seg(middle_layer_output))
-                # scaled_middle_layer = scaled_middle_layer.cpu().data.numpy()
-                # pred_middle = F.softmax(scaled_middle_layer,dim=1)
-                # _, pred_middle = torch.max(pred_middle,1)
-                # pred_middle = pred_middle.cpu().data.numpy()
-                # save_colorful_images(pred_middle, ('test.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-                # scaled_middle_layer = np.ascontiguousarray(np.moveaxis(scaled_middle_layer[0].astype(np.uint8),0,-1))
-                # add miggle layer constraints
-                # pairwise_energy = create_pairwise_bilateral(sdims=(10,10), schan=(0.01,), img=scaled_middle_layer, chdim=2)
-                # d.addPairwiseEnergy(pairwise_energy, compat=10)
-                Q = d.inference(10)
+                    # set unary
+                    U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
+                    d.setUnaryEnergy(U) 
 
-                # Find out the most probable class for each pixel.
-                pred_crf = np.argmax(Q, axis=0).reshape([1,1024,2048])
-                # save_colorful_images(pred_crf, name, output_dir + '_color_CRF',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+                    _, pred_crf = torch.max(final_crf_x, 1)
+                    logits_img_crf = pred_crf.cpu().data.numpy().copy()
+
+                    _, pred_small = torch.max(final_x, 1)
+                    logits_img = pred_small.cpu().data.numpy().copy()
+
+
+                    # set pairwise_energy
+                    d_img = resized_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+                    d_img *= 255
+                    d_img = np.ascontiguousarray(np.moveaxis(d_img[0].astype(np.uint8),0,-1))
+
+                    logits_img_crf = np.moveaxis(final_crf_x[0].cpu().data.numpy().copy(),0,-1)
+                    logits_img_crf = gaussian_filter(logits_img_crf,sigma=smooth)
+                    logits_img_crf = np.moveaxis(logits_img_crf,-1,0)
+
+                    pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img_crf, chdim=0)
+                    if CRF_W > 0:
+                        d.addPairwiseEnergy(pairwise_energy, compat=CRF_W) 
+                    # pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=final_x[0].cpu().data.numpy().copy(), chdim=0)
+                    pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img, chdim=0)
+                    if PRED_W > 0:
+                        d.addPairwiseEnergy(pairwise_energy, compat=PRED_W) 
+
+                    # d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+                    # # This adds the color-dependent term, i.e. features are (x,y,r,g,b).
+
+                    # d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
+                    #                     compat=10,
+                    #                     kernel=dcrf.DIAG_KERNEL,
+                    #                     normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+                    d.addPairwiseGaussian(sxy=POS_XY_STD, compat=POS_W)
+                    d.addPairwiseBilateral(sxy=Bi_XY_STD, srgb=Bi_RGB_STD, rgbim=d_img, compat=Bi_W)
+
+                    Q = d.inference(crf_iter)
+                    print('KL:', d.klDivergence(Q)/np.array(Q).shape[1])
+
+                    # reverse to logits
+                    crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_x).sum(1))
+                    # crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_crf_x).sum(1))
+                    crf_y = F.softmax(F.interpolate(crf_x, size=final_crf.shape[2:], mode="bilinear", align_corners=True),dim=1)
+                    # crf_y = F.softmax(model.module.up(final_x),dim=1);pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
+                    
+
+                    # Find out the most probable class for each pixel.
+                    # pred_crf = np.argmax(Q, axis=0).reshape([1,128,256])
+                    pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
+
+                    save_colorful_images(pred_crf, name, output_dir + '_color_CRF',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+
+                    label_np = label.numpy()
+                    cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+                    idx_list = [6,7,13]
+                    cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
+                    logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                        mAP=round(cur_mAP_crf,2),
+                        avg_mAP=round(ttl_mAP_crf/(iter+1))))
+
+                if crf_model:
+                        
+                    CRF_postprocess()
+                    # CRF_postprocess(CRF_W = 30,PRED_W=0,Bi_RGB_STD = 60,Bi_W=1,POS_W=0)
+                    st()
 
                 if save_vis:
                     save_output_images(pred, name, output_dir)
@@ -1200,17 +1460,10 @@ def attack(attack_data_loader, model, num_classes,
                     save_colorful_images(
                         pred, name, output_dir + '_color',
                         TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-                    save_colorful_images(
-                        pred_crf, name, output_dir + '_color_CRF',
-                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-                    # save_colorful_images_with_mask(
-                    #     pred, name, output_dir + '_color_patch',
-                    #     TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
-                    #     p_mask = patch_rec,
-                    #     t_mask = target_rec,
-                    #     rf_mask = rf_mask)
-                    # upper_mask = np.zeros_like(target_mask)
-                    # upper_mask[:,0:430,:] = 1
+                    if crf_model:
+                        save_colorful_images(
+                            pred_crf, name, output_dir + '_color_CRF',
+                            TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
                     save_colorful_images_with_pointwise_mask(
                         pred, name, output_dir + '_color_patch',
                         TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
@@ -1219,11 +1472,6 @@ def attack(attack_data_loader, model, num_classes,
                         rf_mask = rf_mask_bit)
                 if has_gt:
                     label_np = label.numpy()
-                    # t_hist += fast_hist(pred[:,target_rec[0][1]:target_rec[1][1],
-                    # target_rec[0][0]:target_rec[1][0]].flatten(),
-                    #     label_np[:,target_rec[0][1]:target_rec[1][1],
-                    # target_rec[0][0]:target_rec[1][0]].flatten(),19)
-
                     # changing all other labels to -1
                     cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
                     t_hist += cur_hist
@@ -1239,20 +1487,22 @@ def attack(attack_data_loader, model, num_classes,
                     logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
                         mAP=round(cur_mAP,2),
                         avg_mAP=round(ttl_mAP/(iter+1))))
-                     # CRF map
-                    cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                    t_hist_crf += cur_hist_crf
-                    hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
-                    idx_list = [6,7,13]
-                    cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
-                    if math.isnan(cur_mAP_crf):
-                        ttl_mAP_crf += ttl_mAP_crf/iter
-                        # st()
-                    else:
-                        ttl_mAP_crf += cur_mAP_crf
-                    logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                        mAP=round(cur_mAP_crf,2),
-                        avg_mAP=round(ttl_mAP_crf/(iter+1))))
+                    
+                    # CRF map
+                    if crf_model:
+                        cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+                        t_hist_crf += cur_hist_crf
+                        hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
+                        idx_list = [6,7,13]
+                        cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
+                        if math.isnan(cur_mAP_crf):
+                            ttl_mAP_crf += ttl_mAP_crf/iter
+                            # st()
+                        else:
+                            ttl_mAP_crf += cur_mAP_crf
+                        logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                            mAP=round(cur_mAP_crf,2),
+                            avg_mAP=round(ttl_mAP_crf/(iter+1))))
                 end = time.time()
                 # st()
                 logger.info('Eval: [{0}/{1}]\t'
@@ -1488,7 +1738,12 @@ def attack_seg(args):
     else:
         crf_model = None
 
+    output_base_path = '{}_{}_step_{}_evalnum_{}_dist_{}'.format(args.output_path, args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
+    print('Saving output to {}'.format(output_base_path))
+    if not os.path.exists(output_base_path):
+        os.makedirs(output_base_path)
     out_dir = '{}_{:03d}_{}_attack'.format(args.arch, start_epoch, phase)
+    out_dir = os.path.join(output_base_path, out_dir)
     if len(args.test_suffix) > 0:
         out_dir += '_' + args.test_suffix
     if args.ms:
@@ -1500,11 +1755,16 @@ def attack_seg(args):
                       output_dir=out_dir,
                       scales=scales)
     else:
-        # from pdb import set_trace as st
-        # st()
-        mAP = attack(test_loader, model, args.classes, save_vis=True,
+        if args.rap:
+            mAP = attack_rap(test_loader, model, args.classes, save_vis=True,
                    has_gt=(phase != 'test' or args.with_gt), 
-                   output_dir=out_dir, pgd_steps = args.pgd_steps, crf_model=crf_model)
+                   output_dir=out_dir, pgd_steps = args.pgd_steps, crf_model=crf_model,
+                   eval_num=args.eval_num,patch_dist=args.patch_dist)
+        else:
+            mAP = attack(test_loader, model, args.classes, save_vis=True,
+                   has_gt=(phase != 'test' or args.with_gt), 
+                   output_dir=out_dir, pgd_steps = args.pgd_steps, crf_model=crf_model,
+                   eval_num=args.eval_num,patch_dist=args.patch_dist)
     logger.info('mAP: %f', mAP)
 
 def parse_args():
@@ -1544,8 +1804,10 @@ def parse_args():
                         help='use pre-trained model')
     parser.add_argument('--save_path', default='', type=str, metavar='PATH',
                         help='output path for training checkpoints')
-    parser.add_argument('--log_path', default='', type=str, metavar='PATH',
+    parser.add_argument('--log_dir', default='', type=str, metavar='PATH',
                         help='log path for saving log')
+    parser.add_argument('--output_path', default='', type=str, metavar='PATH',
+                        help='output path for saving output image')
     parser.add_argument('--save_iter', default=1, type=int,
                         help='number of training iterations between'
                              'checkpoint history saves')
@@ -1560,6 +1822,12 @@ def parse_args():
     parser.add_argument('--with-gt', action='store_true')
     parser.add_argument('--test-suffix', default='', type=str)
     parser.add_argument('--pgd-steps', default=0, type=int)
+    parser.add_argument('--eval-num', default=100, type=int)
+    parser.add_argument('--patch-dist', default=0, type=int)
+    parser.add_argument('--rap', action='store_true')
+
+
+
     args = parser.parse_args()
 
     assert args.classes > 0
@@ -1576,7 +1844,13 @@ def parse_args():
 def main():
     args = parse_args()
     FORMAT = "[%(asctime)-15s %(filename)s:%(lineno)d %(funcName)s] %(message)s"
-    logging.basicConfig(filename=args.log_path, filemode='w',format=FORMAT)
+    if args.log_dir:
+        if not os.path.exists(args.log_dir):
+            os.makedirs(args.log_dir,exist_ok=True)
+        log_filename = '{}_step_{}_evalnum_{}_dist_{}.log'.format(args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
+        log_path = os.path.join(args.log_dir,log_filename)
+        logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
+
     global logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
