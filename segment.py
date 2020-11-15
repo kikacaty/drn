@@ -698,10 +698,11 @@ def measureRFSize_pt(model, image, label, target_mask,thres = 0):
 
     return h,w,coord_mask,pt_wise_mask
 
-def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1, beta = 2.):
+def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, 
+    eps=10/255., iters=10, alpha = 1e-1, beta = 2., restarts=1, 
+    target_label=None, rap=False):
     images = image.cuda()
     t_labels = torch.ones_like(label)
-    # t_labels = torch.zeros_like(label)
     labels = t_labels.cuda(async=True)
 
     u_labels = label.cuda(async=True)
@@ -734,11 +735,6 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
 
     ori_images = images.data * std + mean
 
-    # scaling the attack eps
-    # eps *= 1.7585+3.8802
-
-    restarts = 1
-
     model.eval()
 
     for j in range(restarts):
@@ -754,6 +750,18 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
 
             model.zero_grad()
 
+            # remove attack
+            cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+
+            # rap attack
+            if rap:
+                if target_label:
+                    # target attack
+                    cost = - loss(outputs*target_mask, labels*target_label*target_mask)
+                else:
+                    # untargeted attack
+                    cost = loss(outputs*target_mask, u_labels*target_mask)
+
             # targeted attack
             # cost = -loss(outputs*target_mask, labels*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
             # cost = -h_loss(outputs*target_mask, labels*target_mask) - alpha * h_loss(outputs*perturb_mask[:,0,:,:], labels*perturb_mask[:,0,:,:])
@@ -766,7 +774,7 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
             # cost = -loss(outputs*target_mask, labels*2*target_mask) - loss(outputs*target_mask, labels*0*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
 
             # print(loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask).data, loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask).data, loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:]).data)
-            cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
+            # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
             # cost = - 3*loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
             # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
 
@@ -881,6 +889,175 @@ class houdini_loss(nn.Module):
         target_score = torch.sum(logits*target_onehot, dim=1)
         mask = 0.5 + 0.5 * (((pred_score-target_score)/math.sqrt(2)).erf())
         return torch.mean(mask * twod_cross_entropy)
+
+# remote adversarial patch attack
+def attack_rap(attack_data_loader, model, num_classes,
+         output_dir='pred', has_gt=True, save_vis=False, 
+         pgd_steps = 0, crf_model = None,
+         eval_num = 100, patch_dist = 0, ms_defense = False):
+
+    target_labels = [
+            5,6,7, # object
+            11,12, # human
+            13,14,15,16,17,18 # vehicle    
+        ]
+
+    model.eval()
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    end = time.time()
+    hist = np.zeros((num_classes, num_classes))
+    t_hist = hist.copy()
+    ttl_mAP = 0.
+    hist_crf = np.zeros((num_classes, num_classes))
+    t_hist_crf = hist_crf.copy()
+    ttl_mAP_crf = 0.
+    eval_cnt = 0
+    for iter, (image, label, name) in enumerate(attack_data_loader):
+        print('==> Attacking image [{}/{}]...'.format(eval_cnt,eval_num))
+        if eval_cnt >= eval_num:
+            break
+        data_time.update(time.time() - end)
+
+        height, width = image.shape[2:]
+
+        patch_size = (50,300)
+        target_size = 300
+        patch_pos = (450,1100)
+        patch_pos = (520+patch_dist,1100)
+        patch_rec = ((patch_pos[1] - patch_size[1]//2, patch_pos[0] - patch_size[0]//2),
+            (patch_pos[1] + patch_size[1]//2, patch_pos[0] + patch_size[0]//2))
+        target_pos = (380,1100)
+        # target_pos = (280,1100)
+        target_rec = ((target_pos[1] - target_size//2, target_pos[0] - target_size//2),
+            (target_pos[1] + target_size//2, target_pos[0] + target_size//2))
+
+        target_mask = np.zeros_like(label)
+        # target_mask = np.ones_like(label)
+        perturb_mask = np.zeros_like(image)
+        target_mask[:,target_rec[0][1]:target_rec[1][1],
+            target_rec[0][0]:target_rec[1][0]] = 1
+        target_mask = (np.any([label.numpy() == id for id in target_labels],axis = 0) & (target_mask == 1)).astype(np.int8) 
+
+        if target_mask.sum() == 0:
+            print('No target, skipping...')
+            continue
+
+        eval_cnt += 1
+        
+        perturb_mask[:,:,patch_rec[0][1]:patch_rec[1][1],
+            patch_rec[0][0]:patch_rec[1][0]] = 1
+        perturb_mask = perturb_mask.astype(np.int8)
+
+        # adding perturb area to target as well
+        # to avoid spoofing new obstacle at the attack perturbation area
+        loss_mask = target_mask.copy()
+        # loss_mask[:,patch_rec[0][1]:patch_rec[1][1],
+        #     patch_rec[0][0]:patch_rec[1][0]] = 1
+
+        # measure receptive field
+        rf_h, rf_w, rf_mask, rf_mask_bit = measureRFSize_pt(model, image, label, target_mask, thres = 1.)
+        # print('receptive size: ',rf_h, rf_w)
+
+        # Tuning attack hyper params
+        step_size_list = [0.1, 0.2, 0.5, 1.0]
+        step_size_list = [1.0]
+        eps_list = [10./255, 50./255, 100./255, 200./255]
+        eps_list = [1.]
+
+        step_size = 1.0
+        eps = 1.
+
+        # for step_size in step_size_list:
+        #     print('step size: ',step_size)
+        #     for eps in eps_list:
+        #         print('eps: ', eps)
+
+        if pgd_steps == 0:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
+        else:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, 
+            step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5, rap=True)
+
+        image_var = Variable(adv_image)
+
+        # final : log softmax
+        # logits: logits
+        # middle: middle layers output
+
+        final, final_x, logits, middle = model(image_var)
+        _, pred = torch.max(final, 1)
+        pred = pred.cpu().data.numpy()
+        batch_time.update(time.time() - end)
+
+        adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+        adv_img *= 255
+
+        if save_vis:
+            save_output_images(pred, name, output_dir)
+            save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
+            save_colorful_images(
+                pred, name, output_dir + '_color',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+            if crf_model:
+                save_colorful_images(
+                    pred_crf, name, output_dir + '_color_CRF',
+                    TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+            save_colorful_images_with_pointwise_mask(
+                pred, name, output_dir + '_color_patch',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
+                p_mask = perturb_mask,
+                t_mask = target_mask,
+                rf_mask = rf_mask_bit)
+        if has_gt:
+            label_np = label.numpy()
+            # changing all other labels to -1
+            cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+            t_hist += cur_hist
+            hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
+            # idx_list = [6,7,13]
+            # cur_mAP = np.nanmean(per_class_iu(cur_hist)[idx_list]) * 100
+            cur_mAP = np.nanmean(per_class_iu(cur_hist)) * 100
+
+            if math.isnan(cur_mAP):
+                ttl_mAP += ttl_mAP/iter
+                # st()
+            else:
+                ttl_mAP += cur_mAP
+            logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                mAP=round(cur_mAP,2),
+                avg_mAP=round(ttl_mAP/(iter+1))))
+                # CRF map
+            if crf_model:
+                cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+                t_hist_crf += cur_hist_crf
+                hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
+                idx_list = [6,7,13]
+                cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
+                if math.isnan(cur_mAP_crf):
+                    ttl_mAP_crf += ttl_mAP_crf/iter
+                    # st()
+                else:
+                    ttl_mAP_crf += cur_mAP_crf
+                logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                    mAP=round(cur_mAP_crf,2),
+                    avg_mAP=round(ttl_mAP_crf/(iter+1))))
+        end = time.time()
+        # st()
+        ious = per_class_iu(cur_hist) * 100
+        logger.info(' '.join('{:.03f}'.format(i) for i in ious))
+
+        logger.info('Eval: [{0}/{1}]\t'
+                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                    'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                    .format(iter, len(attack_data_loader), batch_time=batch_time,
+                            data_time=data_time))
+
+
+    if has_gt: #val
+        ious = per_class_iu(t_hist) * 100
+        logger.info(' '.join('{:.03f}'.format(i) for i in ious))
+        return round(np.nanmean(ious), 2)
 
 def attack(attack_data_loader, model, num_classes,
          output_dir='pred', has_gt=True, save_vis=False, pgd_steps=0, eval_num = 100,patch_dist = 0):
@@ -1224,6 +1401,22 @@ def attack_seg(args):
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
+    # crf model
+    if args.crf_model:
+        single_crf_model = CRF_helper(args.arch, args.classes, pretrained_model=None,
+                          pretrained=False,drnseg=model)
+        crf_model = torch.nn.DataParallel(single_crf_model).cuda()
+        if os.path.isfile(args.crf_model):
+            logger.info("=> loading checkpoint '{}'".format(args.crf_model))
+            checkpoint = torch.load(args.crf_model)
+            crf_model.load_state_dict(checkpoint['state_dict'])
+            logger.info("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.crf_model, checkpoint['epoch']))
+        else:
+            logger.info("=> no checkpoint found at '{}'".format(args.crf_model))
+    else:
+        crf_model = None
+
     output_path = '{}_{}_step_{}_evalnum_{}_dist_{}'.format(args.output_path, args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
     if not os.path.exists(output_path):
         os.makedirs(output_path)
@@ -1240,16 +1433,22 @@ def attack_seg(args):
                       output_dir=out_dir,
                       scales=scales)
     else:
-        # from pdb import set_trace as st
-        # st()
-        mAP = attack(test_loader, model, args.classes, save_vis=True,
-                   has_gt=(phase != 'test' or args.with_gt), output_dir=out_dir, pgd_steps=args.pgd_steps,eval_num=args.eval_num,patch_dist=args.patch_dist)
+        if args.rap:
+            mAP = attack_rap(test_loader, model, args.classes, save_vis=True,
+                   has_gt=(phase != 'test' or args.with_gt), 
+                   output_dir=out_dir, pgd_steps = args.pgd_steps, crf_model=crf_model,
+                   eval_num=args.eval_num,patch_dist=args.patch_dist)
+        else:
+            mAP = attack(test_loader, model, args.classes, save_vis=True,
+                   has_gt=(phase != 'test' or args.with_gt), 
+                   output_dir=out_dir, pgd_steps = args.pgd_steps, crf_model=crf_model,
+                   eval_num=args.eval_num,patch_dist=args.patch_dist)
     logger.info('mAP: %f', mAP)
 
 def parse_args():
     # Training settings
     parser = argparse.ArgumentParser(description='')
-    parser.add_argument('cmd', choices=['train', 'test', 'attack'])
+    parser.add_argument('cmd', choices=['train', 'test', 'attack', 'train_crf'])
     parser.add_argument('-d', '--data-dir', default=None, required=True)
     parser.add_argument('-l', '--list-dir', default=None,
                         help='List dir to look for train_images.txt etc. '
@@ -1274,6 +1473,10 @@ def parse_args():
                         help='evaluate model on validation set')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
+    parser.add_argument('--base_model', default='', type=str, metavar='PATH',
+                        help='path to base model checkpoint (default: none)')
+    parser.add_argument('--crf_model', default='', type=str, metavar='PATH',
+                        help='path to crf model checkpoint (default: none)')
     parser.add_argument('--pretrained', dest='pretrained',
                         default='', type=str, metavar='PATH',
                         help='use pre-trained model')
@@ -1299,6 +1502,10 @@ def parse_args():
     parser.add_argument('--pgd-steps', default=0, type=int)
     parser.add_argument('--eval-num', default=100, type=int)
     parser.add_argument('--patch-dist', default=0, type=int)
+    parser.add_argument('--rap', action='store_true')
+
+
+
     args = parser.parse_args()
 
     assert args.classes > 0
@@ -1315,11 +1522,14 @@ def parse_args():
 def main():
     args = parse_args()
     FORMAT = "[%(asctime)-15s %(filename)s:%(lineno)d %(funcName)s] %(message)s"
-    if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir,exist_ok=True)
-    log_filename = '{}_step_{}_evalnum_{}_dist_{}.log'.format(args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
-    log_path = os.path.join(args.log_dir,log_filename)
-    logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
+    if args.log_dir:
+        if not os.path.exists(args.log_dir):
+            os.makedirs(args.log_dir,exist_ok=True)
+        log_filename = '{}_step_{}_evalnum_{}_dist_{}.log'.format(args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
+        log_path = os.path.join(args.log_dir,log_filename)
+        print('Saving to log: ', log_path)
+        logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
+
     global logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
@@ -1330,6 +1540,8 @@ def main():
         test_seg(args)
     elif args.cmd == 'attack':
         attack_seg(args)
+    elif args.cmd == 'train_crf':
+        train_seg_crf(args)
 
 
 if __name__ == '__main__':
