@@ -1084,7 +1084,7 @@ class houdini_loss(nn.Module):
 def attack_rap(attack_data_loader, model, num_classes,
          output_dir='pred', has_gt=True, save_vis=False, 
          pgd_steps = 0, crf_model = None,
-         eval_num = 100, patch_dist = 0):
+         eval_num = 100, patch_dist = 0, ms_defense = False):
 
     target_labels = [
             5,6,7, # object
@@ -1293,8 +1293,7 @@ def attack(attack_data_loader, model, num_classes,
         target_mask = np.zeros_like(label)
         # target_mask = np.ones_like(label)
         perturb_mask = np.zeros_like(image)
-        target_mask[:,target_rec[0][1]:target_rec[1][1],
-            target_rec[0][0]:target_rec[1][0]] = 1
+        target_mask[:,target_rec[0][1]:target_rec[1][1],target_rec[0][0]:target_rec[1][0]] = 1
 
         target_mask = (np.any([label.numpy() == id for id in target_labels],axis = 0) & (target_mask == 1)).astype(np.int8) 
         
@@ -1343,16 +1342,108 @@ def attack(attack_data_loader, model, num_classes,
         adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
         adv_img *= 255
 
-        POS_W = 3
-        POS_XY_STD = 1
-        Bi_W = 4
-        Bi_XY_STD = 67
-        Bi_RGB_STD = 10
-        crf_iter = 10
-        CRF_W = 4
-        CRF_XY_STD = 67
-        CRF_CHAN_STD = 0.1
-        # CRF defense
+        def inference_ms_image(image,ms = 2, split = False):
+            w, h = image.shape[2:]
+            scaled_image = F.interpolate(adv_image, scale_factor=ms, mode="bilinear", align_corners=True)
+            if split:
+                scaled_pred = torch.zeros(adv_image.shape[0],w*ms,h*ms)
+                for i in range(ms):
+                    for j in range(ms):
+                        image_ms = scaled_image[:,:,i*w:(i+1)*w,j*h:(j+1)*h]
+                        final, final_x, logits, middle = model(image_ms)
+                        scaled_pred[:,i*w:(i+1)*w,j*h:(j+1)*h] =  torch.max(final, 1)[1]
+            else:
+                image_ms = scaled_image
+                final, final_x, logits, middle = model(image_ms)
+                scaled_pred =  torch.max(final, 1)[1]
+            # pred = torch.squeeze(F.interpolate(torch.unsqueeze(scaled_pred,0), size=(w,h)),0)
+            pred = scaled_pred.cpu().data.numpy().astype(np.uint8)
+
+            return pred
+
+        ms_pred = inference_ms_image(adv_image);save_colorful_images(ms_pred, ('ms.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+
+        st()
+
+        # remapping
+        def seg_parse(model, image, pred, target_labels, seg_iter):
+            fg_mask = (np.any([pred == id for id in target_labels],axis = 0)).astype(np.int8) 
+            fg_mask = np.expand_dims(np.concatenate([fg_mask]*3),0)
+            
+            for i in range(seg_iter):
+
+                new_image = image.copy()
+                fg_image = new_image * fg_mask
+                bg_image = new_image - fg_image
+
+                fg_img = fg_image * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+                fg_img *= 255
+                bg_img = bg_image * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+                bg_img *= 255
+
+                save_output_images(np.moveaxis(fg_img,1,-1), ('fg.png',), 'test')
+                save_output_images(np.moveaxis(bg_img,1,-1), ('bg.png',), 'test')
+
+
+                fg_image_t = torch.from_numpy(fg_image).cuda()
+                bg_image_t = torch.from_numpy(bg_image).cuda()
+
+                final_fg = model(fg_image_t)[0]
+                _, pred_fg = torch.max(final_fg, 1)
+                pred_fg = pred_fg.cpu().data.numpy()
+
+
+                final_bg = model(bg_image_t)[0]
+                _, pred_bg = torch.max(final_bg, 1)
+                pred_bg = pred_bg.cpu().data.numpy()
+
+                save_colorful_images(pred_fg, ('fg_pred.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+                save_colorful_images(pred_bg, ('bg_pred.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+
+                # adding fg in bg to fg
+                fg_mask = (np.any([pred_bg == id for id in target_labels],axis = 0) | fg_mask).astype(np.int8) 
+            
+            return fg_mask
+
+
+        def crf_dense(image, output_probs, fg_mask, crf_iter=10,
+            POS_W = 3,
+            POS_XY_STD = 1,
+            Bi_W = 4,
+            Bi_XY_STD = 67,
+            Bi_RGB_STD = 3):
+
+            U = unary_from_softmax(output_probs)
+            U = np.ascontiguousarray(U)
+
+            c,h,w = output_probs.shape
+
+            d_img = image * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+            d_img = np.ascontiguousarray(np.moveaxis(d_img[0].astype(np.uint8),0,-1))
+
+            d = dcrf.DenseCRF2D(w, h, c)
+            d.setUnaryEnergy(U)
+            d.addPairwiseGaussian(sxy=POS_XY_STD, compat=POS_W)
+            
+            fg_feature = np.ascontiguousarray(np.moveaxis(fg_mask[0].copy().astype(np.uint8),0,-1))*255
+
+            d.addPairwiseBilateral(sxy=Bi_XY_STD, srgb=Bi_RGB_STD, rgbim=fg_feature, compat=Bi_W)
+            # pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), 
+            #     img=fg_mask, chdim=0)
+
+            Q = d.inference(crf_iter)
+            print('KL: ',d.klDivergence(Q) / (h*w))
+            Q = np.argmax(np.array(Q),0).reshape(pred.shape)
+
+            save_colorful_images(Q, ('pred_crf.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+
+
+        output_probs = F.softmax(logits, dim = 1)[0].cpu().data.numpy().copy()
+        print(output_probs.shape)
+        # fg_mask = seg_parse(model, adv_image.cpu().data.numpy(),pred,target_labels,5)
+        # crf_dense(adv_image.cpu().data.numpy(), output_probs,fg_mask)
+        # save_colorful_images(pred, ('pred.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+
 
         def CRF_postprocess(
             POS_W = 3, 
