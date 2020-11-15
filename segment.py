@@ -1282,7 +1282,6 @@ def attack(attack_data_loader, model, num_classes,
 
         patch_size = (50,300)
         target_size = 300
-        patch_pos = (450,1100)
         patch_pos = (520+patch_dist,1100)
         patch_rec = ((patch_pos[1] - patch_size[1]//2, patch_pos[0] - patch_size[0]//2),
             (patch_pos[1] + patch_size[1]//2, patch_pos[0] + patch_size[0]//2))
@@ -1325,184 +1324,184 @@ def attack(attack_data_loader, model, num_classes,
         eps_list = [10./255, 50./255, 100./255, 200./255]
         eps_list = [1.]
 
-        for step_size in step_size_list:
-            print('step size: ',step_size)
-            for eps in eps_list:
-                print('eps: ', eps)
+        if pgd_steps == 0:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
+        else:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5)
 
-                if pgd_steps == 0:
-                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
+        image_var = Variable(adv_image)
+
+        # final : log softmax
+        # logits: logits
+        # middle: middle layers output
+
+        final, final_x, logits, middle = model(image_var)
+        _, pred = torch.max(final, 1)
+        pred = pred.cpu().data.numpy()
+        batch_time.update(time.time() - end)
+
+        adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+        adv_img *= 255
+
+        POS_W = 3
+        POS_XY_STD = 1
+        Bi_W = 4
+        Bi_XY_STD = 67
+        Bi_RGB_STD = 10
+        crf_iter = 10
+        CRF_W = 4
+        CRF_XY_STD = 67
+        CRF_CHAN_STD = 0.1
+        # CRF defense
+
+        def CRF_postprocess(
+            POS_W = 3, 
+            POS_XY_STD = 1,
+            Bi_W = 4,
+            Bi_XY_STD = 67,
+            Bi_RGB_STD = 3,
+            crf_iter = 10,
+            CRF_W = 4,
+            CRF_XY_STD = 67,
+            CRF_CHAN_STD = 0.1,
+            PRED_W = 3, smooth=0):
+
+            # for crf_iter in [1,5,10]:
+            #     for CRF_W in [10]:
+            #         for CRF_CHAN_STD in [0.01]:
+            crf_model.eval()
+
+            print('Iter: {}, weight: {}, crf_chan_std: {}'.format(crf_iter, CRF_W, CRF_CHAN_STD))
+            d = dcrf.DenseCRF2D(256, 128, 19)  # width, height, nlabels
+            final_crf, final_crf_x, logits_crf, middle_crf = crf_model(image_var)
+            resized_image = F.interpolate(image_var, size=final_crf_x.shape[2:], mode="bilinear", align_corners=True)
+            normalized_final_x = (final_x - final_x.mean())/final_x.std()
+            probs = F.softmax(normalized_final_x, dim = 1)
+
+            # set unary
+            U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
+            d.setUnaryEnergy(U) 
+
+            _, pred_crf = torch.max(final_crf_x, 1)
+            logits_img_crf = pred_crf.cpu().data.numpy().copy()
+
+            _, pred_small = torch.max(final_x, 1)
+            logits_img = pred_small.cpu().data.numpy().copy()
+
+
+            # set pairwise_energy
+            d_img = resized_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+            d_img *= 255
+            d_img = np.ascontiguousarray(np.moveaxis(d_img[0].astype(np.uint8),0,-1))
+
+            # logits_img_crf = np.moveaxis(final_crf_x[0].cpu().data.numpy().copy(),0,-1)
+            # logits_img_crf = gaussian_filter(logits_img_crf,sigma=smooth)
+            # logits_img_crf = np.moveaxis(logits_img_crf,-1,0)
+
+            pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img_crf, chdim=0)
+            if CRF_W > 0:
+                d.addPairwiseEnergy(pairwise_energy, compat=CRF_W) 
+            # pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=final_x[0].cpu().data.numpy().copy(), chdim=0)
+            pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img, chdim=0)
+            if PRED_W > 0:
+                d.addPairwiseEnergy(pairwise_energy, compat=PRED_W) 
+
+            # d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+            # # This adds the color-dependent term, i.e. features are (x,y,r,g,b).
+
+            # d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
+            #                     compat=10,
+            #                     kernel=dcrf.DIAG_KERNEL,
+            #                     normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+            d.addPairwiseGaussian(sxy=POS_XY_STD, compat=POS_W)
+            d.addPairwiseBilateral(sxy=Bi_XY_STD, srgb=Bi_RGB_STD, rgbim=d_img, compat=Bi_W)
+
+            Q = d.inference(crf_iter)
+            print('KL:', d.klDivergence(Q)/np.array(Q).shape[1])
+
+            # reverse to logits
+            crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_x).sum(1))
+            # crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_crf_x).sum(1))
+            crf_y = F.softmax(F.interpolate(crf_x, size=final_crf.shape[2:], mode="bilinear", align_corners=True),dim=1)
+            # crf_y = F.softmax(model.module.up(final_x),dim=1);pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
+            
+
+            # Find out the most probable class for each pixel.
+            # pred_crf = np.argmax(Q, axis=0).reshape([1,128,256])
+            pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
+
+            save_colorful_images(pred_crf, name, output_dir + '_color_CRF',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+
+            label_np = label.numpy()
+            cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+            idx_list = [6,7,13]
+            cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
+            logger.debug('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                mAP=round(cur_mAP_crf,2),
+                avg_mAP=round(ttl_mAP_crf/(iter+1))))
+
+        if crf_model:
+                
+            CRF_postprocess()
+            # CRF_postprocess(CRF_W = 30,PRED_W=0,Bi_RGB_STD = 60,Bi_W=1,POS_W=0)
+            st()
+
+        if save_vis:
+            save_output_images(pred, name, output_dir)
+            save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
+            save_colorful_images(
+                pred, name, output_dir + '_color',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+            if crf_model:
+                save_colorful_images(
+                    pred_crf, name, output_dir + '_color_CRF',
+                    TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+            save_colorful_images_with_pointwise_mask(
+                pred, name, output_dir + '_color_patch',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
+                p_mask = perturb_mask,
+                t_mask = target_mask,
+                rf_mask = rf_mask_bit)
+        if has_gt:
+            label_np = label.numpy()
+            # changing all other labels to -1
+            cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+            t_hist += cur_hist
+            hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
+            # idx_list = [6,7,13]
+            # cur_mAP = np.nanmean(per_class_iu(cur_hist)[idx_list]) * 100
+            cur_mAP = np.nanmean(per_class_iu(cur_hist)) * 100
+
+            if math.isnan(cur_mAP):
+                ttl_mAP += ttl_mAP/iter
+                # st()
+            else:
+                ttl_mAP += cur_mAP
+            logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                mAP=round(cur_mAP,2),
+                avg_mAP=round(ttl_mAP/(iter+1))))
+            
+            ious = per_class_iu(cur_hist) * 100	
+            logger.info(' '.join('{:.03f}'.format(i) for i in ious))
+            # CRF map
+            if crf_model:
+                cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+                t_hist_crf += cur_hist_crf
+                hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
+                # idx_list = [6,7,13]
+                # cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
+                cur_mAP = np.nanmean(per_class_iu(cur_hist)) * 100
+
+                if math.isnan(cur_mAP_crf):
+                    ttl_mAP_crf += ttl_mAP_crf/iter
+                    # st()
                 else:
-                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5)
-
-                image_var = Variable(adv_image)
-
-                # final : log softmax
-                # logits: logits
-                # middle: middle layers output
-
-                final, final_x, logits, middle = model(image_var)
-                _, pred = torch.max(final, 1)
-                pred = pred.cpu().data.numpy()
-                batch_time.update(time.time() - end)
-
-                adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
-                adv_img *= 255
-
-                POS_W = 3
-                POS_XY_STD = 1
-                Bi_W = 4
-                Bi_XY_STD = 67
-                Bi_RGB_STD = 10
-                crf_iter = 10
-                CRF_W = 4
-                CRF_XY_STD = 67
-                CRF_CHAN_STD = 0.1
-                # CRF defense
-
-                def CRF_postprocess(
-                    POS_W = 3, 
-                    POS_XY_STD = 1,
-                    Bi_W = 4,
-                    Bi_XY_STD = 67,
-                    Bi_RGB_STD = 3,
-                    crf_iter = 10,
-                    CRF_W = 4,
-                    CRF_XY_STD = 67,
-                    CRF_CHAN_STD = 0.1,
-                    PRED_W = 3, smooth=3):
-
-                    # for crf_iter in [1,5,10]:
-                    #     for CRF_W in [10]:
-                    #         for CRF_CHAN_STD in [0.01]:
-                    crf_model.eval()
-
-                    print('Iter: {}, weight: {}, crf_chan_std: {}'.format(crf_iter, CRF_W, CRF_CHAN_STD))
-                    d = dcrf.DenseCRF2D(256, 128, 19)  # width, height, nlabels
-                    final_crf, final_crf_x, logits_crf, middle_crf = crf_model(image_var)
-                    resized_image = F.interpolate(image_var, size=final_crf_x.shape[2:], mode="bilinear", align_corners=True)
-                    normalized_final_x = (final_x - final_x.mean())/final_x.std()
-                    probs = F.softmax(normalized_final_x, dim = 1)
-
-                    # set unary
-                    U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
-                    d.setUnaryEnergy(U) 
-
-                    _, pred_crf = torch.max(final_crf_x, 1)
-                    logits_img_crf = pred_crf.cpu().data.numpy().copy()
-
-                    _, pred_small = torch.max(final_x, 1)
-                    logits_img = pred_small.cpu().data.numpy().copy()
-
-
-                    # set pairwise_energy
-                    d_img = resized_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
-                    d_img *= 255
-                    d_img = np.ascontiguousarray(np.moveaxis(d_img[0].astype(np.uint8),0,-1))
-
-                    logits_img_crf = np.moveaxis(final_crf_x[0].cpu().data.numpy().copy(),0,-1)
-                    logits_img_crf = gaussian_filter(logits_img_crf,sigma=smooth)
-                    logits_img_crf = np.moveaxis(logits_img_crf,-1,0)
-
-                    pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img_crf, chdim=0)
-                    if CRF_W > 0:
-                        d.addPairwiseEnergy(pairwise_energy, compat=CRF_W) 
-                    # pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=final_x[0].cpu().data.numpy().copy(), chdim=0)
-                    pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img, chdim=0)
-                    if PRED_W > 0:
-                        d.addPairwiseEnergy(pairwise_energy, compat=PRED_W) 
-
-                    # d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,normalization=dcrf.NORMALIZE_SYMMETRIC)
-
-                    # # This adds the color-dependent term, i.e. features are (x,y,r,g,b).
-
-                    # d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
-                    #                     compat=10,
-                    #                     kernel=dcrf.DIAG_KERNEL,
-                    #                     normalization=dcrf.NORMALIZE_SYMMETRIC)
-
-                    d.addPairwiseGaussian(sxy=POS_XY_STD, compat=POS_W)
-                    d.addPairwiseBilateral(sxy=Bi_XY_STD, srgb=Bi_RGB_STD, rgbim=d_img, compat=Bi_W)
-
-                    Q = d.inference(crf_iter)
-                    print('KL:', d.klDivergence(Q)/np.array(Q).shape[1])
-
-                    # reverse to logits
-                    crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_x).sum(1))
-                    # crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_crf_x).sum(1))
-                    crf_y = F.softmax(F.interpolate(crf_x, size=final_crf.shape[2:], mode="bilinear", align_corners=True),dim=1)
-                    # crf_y = F.softmax(model.module.up(final_x),dim=1);pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
-                    
-
-                    # Find out the most probable class for each pixel.
-                    # pred_crf = np.argmax(Q, axis=0).reshape([1,128,256])
-                    pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
-
-                    save_colorful_images(pred_crf, name, output_dir + '_color_CRF',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-
-                    label_np = label.numpy()
-                    cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                    idx_list = [6,7,13]
-                    cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
-                    logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                        mAP=round(cur_mAP_crf,2),
-                        avg_mAP=round(ttl_mAP_crf/(iter+1))))
-
-                if crf_model:
-                        
-                    CRF_postprocess()
-                    # CRF_postprocess(CRF_W = 30,PRED_W=0,Bi_RGB_STD = 60,Bi_W=1,POS_W=0)
-                    st()
-
-                if save_vis:
-                    save_output_images(pred, name, output_dir)
-                    save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
-                    save_colorful_images(
-                        pred, name, output_dir + '_color',
-                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-                    if crf_model:
-                        save_colorful_images(
-                            pred_crf, name, output_dir + '_color_CRF',
-                            TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-                    save_colorful_images_with_pointwise_mask(
-                        pred, name, output_dir + '_color_patch',
-                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
-                        p_mask = perturb_mask,
-                        t_mask = target_mask,
-                        rf_mask = rf_mask_bit)
-                if has_gt:
-                    label_np = label.numpy()
-                    # changing all other labels to -1
-                    cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                    t_hist += cur_hist
-                    hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
-                    idx_list = [6,7,13]
-                    cur_mAP = np.nanmean(per_class_iu(cur_hist)[idx_list]) * 100
-
-                    if math.isnan(cur_mAP):
-                        ttl_mAP += ttl_mAP/iter
-                        # st()
-                    else:
-                        ttl_mAP += cur_mAP
-                    logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                        mAP=round(cur_mAP,2),
-                        avg_mAP=round(ttl_mAP/(iter+1))))
-                    
-                    # CRF map
-                    if crf_model:
-                        cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                        t_hist_crf += cur_hist_crf
-                        hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
-                        idx_list = [6,7,13]
-                        cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
-                        if math.isnan(cur_mAP_crf):
-                            ttl_mAP_crf += ttl_mAP_crf/iter
-                            # st()
-                        else:
-                            ttl_mAP_crf += cur_mAP_crf
-                        logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                            mAP=round(cur_mAP_crf,2),
-                            avg_mAP=round(ttl_mAP_crf/(iter+1))))
+                    ttl_mAP_crf += cur_mAP_crf
+                logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                    mAP=round(cur_mAP_crf,2),
+                    avg_mAP=round(ttl_mAP_crf/(iter+1))))
                 end = time.time()
                 # st()
                 logger.info('Eval: [{0}/{1}]\t'
@@ -1511,10 +1510,15 @@ def attack(attack_data_loader, model, num_classes,
                             .format(iter, len(attack_data_loader), batch_time=batch_time,
                                     data_time=data_time))
 
+                ious = per_class_iu(cur_hist_crf) * 100	
+                logger.info(' '.join('{:.03f}'.format(i) for i in ious))
 
     if has_gt: #val
-        ious = per_class_iu(hist) * 100
+        ious = per_class_iu(t_hist) * 100
         logger.info(' '.join('{:.03f}'.format(i) for i in ious))
+        if crf_model:
+            ious = per_class_iu(t_hist_crf) * 100
+            logger.info('CRF: '+' '.join('{:.03f}'.format(i) for i in ious))
         return round(np.nanmean(ious), 2)
 
 def resize_4d_tensor(tensor, width, height):
@@ -1849,6 +1853,7 @@ def main():
             os.makedirs(args.log_dir,exist_ok=True)
         log_filename = '{}_step_{}_evalnum_{}_dist_{}.log'.format(args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
         log_path = os.path.join(args.log_dir,log_filename)
+        print('Saving to log: ', log_path)
         logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
 
     global logger

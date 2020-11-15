@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import re
+from PIL import Image
+import PIL
 
 def parse_log(log_fn):
     with open(log_fn, 'r') as log_f:
@@ -46,5 +48,27 @@ def main():
     plt.legend()
     fig.savefig('figs/attack_step_mAP.png')
 
+def gen_demo_figures():
+
+    drn = np.asarray(Image.open('figs/drn.png'))[:,1100-521:1100+512,:]
+    drn_adv = np.asarray(Image.open('figs/drn_adv.png'))[:,1100-521:1100+512,:]
+    drn_adv_img = np.asarray(Image.open('figs/drn_adv_img.png'))[:,1100-521:1100+512,:]
+    gt_img = np.asarray(Image.open('figs/gt_img.png'))[:,1100-521:1100+512,:]
+    gt = np.asarray(Image.open('figs/gt.png'))[:,1100-521:1100+512,:]
+
+    height, width = drn.shape[:2]
+    print(drn.shape)
+    adv_side_by_side = drn.copy()
+    adv_side_by_side[:,width//2:,:] = drn_adv[:,width//2:,:]
+    adv_img_side_by_side = gt_img.copy()
+    adv_img_side_by_side[:,width//2:,:] = drn_adv_img[:,width//2:,:]
+
+    Image.fromarray(adv_img_side_by_side).save('figs/adv_img_side_by_side.png')
+    Image.fromarray(adv_side_by_side).save('figs/adv_side_by_side.png')
+
+
+    pass
+
 if __name__ == "__main__":
-    main()
+    # main()
+    gen_demo_figures()
