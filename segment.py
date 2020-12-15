@@ -1278,6 +1278,8 @@ def attack(attack_data_loader, model, num_classes,
 
         data_time.update(time.time() - end)
 
+        st()
+
         height, width = image.shape[2:]
 
         patch_size = (50,300)
@@ -1785,6 +1787,7 @@ def attack_seg(args):
     info = json.load(open(join(data_dir, 'info.json'), 'r'))
     normalize = transforms.Normalize(mean=info['mean'], std=info['std'])
     scales = [0.5, 0.75, 1.25, 1.5, 1.75]
+
     if args.ms:
         dataset = SegListMS(data_dir, phase, transforms.Compose([
             transforms.ToTensor(),
