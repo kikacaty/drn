@@ -22,11 +22,11 @@ from segment import DRNSeg, SegList, SegListMS
 
 from pdb import set_trace as st
 
-# target_labels = [
-#             5,6,7, # object
-#             11,12, # human
-#             13,14,15,16,17,18 # vehicle    
-#         ]
+target_labels = [
+            5,6,7, # object: pole, traffic light, traffic sign
+            11,12, # human: person, rider
+            13,14,15,16,17,18 # vehicle: car, truck, bus, train, motorcycle, bicycle
+        ]
 
 target_labels = [13]
 
@@ -93,18 +93,20 @@ class ModelOutputs():
 
 
 def preprocess_image(img):
-    means = [0.485, 0.456, 0.406]
-    stds = [0.229, 0.224, 0.225]
+    # means = [0.485, 0.456, 0.406]
+    # stds = [0.229, 0.224, 0.225]
+    NORM_MEAN = np.array([0.29010095242892997, 0.32808144844279574, 0.28696394422942517])
+    NORM_STD = np.array([0.1829540508368939, 0.18656561047509476, 0.18447508988480435])
 
     preprocessed_img = img.copy()[:, :, ::-1]
-    for i in range(3):
-        preprocessed_img[:, :, i] = preprocessed_img[:, :, i] - means[i]
-        preprocessed_img[:, :, i] = preprocessed_img[:, :, i] / stds[i]
-    preprocessed_img = \
-        np.ascontiguousarray(np.transpose(preprocessed_img, (2, 0, 1)))
-    preprocessed_img = torch.from_numpy(preprocessed_img)
-    preprocessed_img.unsqueeze_(0)
-    input = preprocessed_img.requires_grad_(True)
+    # for i in range(3):
+    #     preprocessed_img[:, :, i] = preprocessed_img[:, :, i] - means[i]
+    #     preprocessed_img[:, :, i] = preprocessed_img[:, :, i] / stds[i]
+    # preprocessed_img = \
+    #     np.ascontiguousarray(np.transpose(preprocessed_img, (2, 0, 1)))
+    # preprocessed_img = torch.from_numpy(preprocessed_img)
+    # preprocessed_img.unsqueeze_(0)
+    # input = preprocessed_img.requires_grad_(True)
     return input
 
 def reverse_image(img):
@@ -191,8 +193,6 @@ class GradCam:
                 one_hot = torch.from_numpy(one_hot).requires_grad_(True)
                 seg_mask = torch.from_numpy(seg_mask)
 
-                st()
-
                 if self.cuda:
                     one_hot = torch.sum(one_hot.cuda() * output * seg_mask.cuda())
                 else:
@@ -210,20 +210,17 @@ class GradCam:
                 weights = np.mean(grads_val, axis=(2, 3))[0, :]
                 cam = np.zeros(target.shape[1:], dtype=np.float32)
 
-
-                st()
+                # target = target * grads_val[0]
 
                 for i, w in enumerate(weights):
-                    cam += np.max([0,w]) * target[i, :, :]
+                    cam += w * target[i, :, :]
 
-                cam = grads_val[0] * target
-                cam = np.mean(cam, axis=0)
-                np.flip(cam,[0,1])
+                # cam = grads_val[0] * target
+                # cam = np.mean(cam, axis=0)
+                # np.flip(cam,[0,1])
 
-                st()
-
-                # cam = np.maximum(cam, 0)
-                cam = cv2.resize(cam, input.shape[2:]).transpose((1,0))
+                cam = np.maximum(cam, 0)
+                cam = cv2.resize(cam, input.shape[-1:-3:-1])
                 cam = cam - np.min(cam)
                 cam = cam / np.max(cam)
 
@@ -349,7 +346,7 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--use-cuda', action='store_true', default=True,
                         help='Use NVIDIA GPU acceleration')
-    parser.add_argument('--image-path', type=str, default='./examples/both.png',
+    parser.add_argument('--image-path', type=str, default='',
                         help='Input image path')
     parser.add_argument('--arch')
     parser.add_argument('-c', '--classes', default=0, type=int)
@@ -459,10 +456,17 @@ if __name__ == '__main__':
     # grad_cam = GradCam(model=model, feature_module=model.layer4, \
     #                    target_layer_names=["2"], use_cuda=args.use_cuda)
 
-    for iter, (image, label, name) in enumerate(eval_data_loader):
-        
+    if os.path.exists(args.image_path):
+        img = cv2.imread(args.image_path, 1)/255.
+        NORM_MEAN = np.array([0.29010095242892997, 0.32808144844279574, 0.28696394422942517])
+        NORM_STD = np.array([0.1829540508368939, 0.18656561047509476, 0.18447508988480435])
+        img = img.transpose((2,0,1))
+        img_input = ((img - NORM_STD.reshape((3,1,1)))/NORM_MEAN.reshape((3,1,1))).astype(np.float32)
+        image = torch.from_numpy(img_input).unsqueeze(0)
+
+        st()
+
         h, w = image.size()[2:4]
-        outputs = []
         image_var = Variable(image, requires_grad=False, volatile=True)
 
         # generating gradcam mask 
@@ -471,55 +475,79 @@ if __name__ == '__main__':
 
         target_index = None
         seg_mask = np.zeros([1,19,1024,2048])
-        seg_mask[:,:,230:530,950:1250] = 1
+        # seg_mask[:,:,230:530,950:1250] = 1
+        seg_mask[:,:,:,:] = 1
         mask = grad_cam(input, target_index, seg_mask)
-
-        gb_model = GuidedBackpropReLUModel(model=seg_model.module, use_cuda=args.use_cuda)
-        gb = gb_model(input, index=target_index, seg_mask = seg_mask)
 
         img = reverse_image(image.cpu().data.numpy())[0].transpose((1,2,0))
         
         cv_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
         show_cam_on_image(cv_img.astype(np.float32)/255, mask)
-
-        gb = gb.transpose((1, 2, 0))
-        cam_mask = cv2.merge([mask, mask, mask])
-        cam_gb = deprocess_image(cam_mask*gb)
-        gb = deprocess_image(gb)
-
-        cv2.imwrite('grad_cam/gb.jpg', gb)
-        cv2.imwrite('grad_cam/cam_gb.jpg', cam_gb)
-
         st()
-        
-        final = model(image_var)[0]
-        outputs.append(final.data)
-
+    else:
+        for iter, (image, label, name) in enumerate(eval_data_loader):
             
-        final = sum([resize_4d_tensor(out, w, h) for out in outputs])
-        # _, pred = torch.max(torch.from_numpy(final), 1)
-        # pred = pred.cpu().numpy()
-        pred = final.argmax(axis=1)
-        batch_time.update(time.time() - end)
-        '''
-        if save_vis:
-            save_output_images(pred, name, output_dir)
-            save_colorful_images(pred, name, output_dir + '_color',
-                                 CITYSCAPE_PALETTE)
-        if has_gt:
-            label = label.numpy()
-            hist += fast_hist(pred.flatten(), label.flatten(), num_classes)
-            logger.info('===> mAP {mAP:.3f}'.format(
-                mAP=round(np.nanmean(per_class_iu(hist)) * 100, 2)))
-        end = time.time()
-        logger.info('Eval: [{0}/{1}]\t'
-                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                    'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                    .format(iter, len(eval_data_loader), batch_time=batch_time,
-                            data_time=data_time))
-        '''
+            h, w = image.size()[2:4]
+            outputs = []
+            image_var = Variable(image, requires_grad=False, volatile=True)
 
-        # img = cv2.imread(args.image_path, 1)
-        # img = np.float32(cv2.resize(img, (224, 224))) / 255
-        # input = preprocess_image(img)
+            # generating gradcam mask 
+
+            input = image.requires_grad_(True)
+
+            target_index = None
+            seg_mask = np.zeros([1,19,1024,2048])
+            # seg_mask[:,:,230:530,950:1250] = 1
+            seg_mask[:,:,:,:] = 1
+            mask = grad_cam(input, target_index, seg_mask)
+
+            img = reverse_image(image.cpu().data.numpy())[0].transpose((1,2,0))
+            
+            cv_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            show_cam_on_image(cv_img.astype(np.float32)/255, mask)
+
+            st()
+
+            gb_model = GuidedBackpropReLUModel(model=seg_model.module, use_cuda=args.use_cuda)
+            gb = gb_model(input, index=target_index, seg_mask = seg_mask)
+
+            gb = gb.transpose((1, 2, 0))
+            cam_mask = cv2.merge([mask, mask, mask])
+            cam_gb = deprocess_image(cam_mask*gb)
+            gb = deprocess_image(gb)
+
+            cv2.imwrite('grad_cam/gb.jpg', gb)
+            cv2.imwrite('grad_cam/cam_gb.jpg', cam_gb)
+
+            st()
+            
+            final = model(image_var)[0]
+            outputs.append(final.data)
+
+                
+            final = sum([resize_4d_tensor(out, w, h) for out in outputs])
+            # _, pred = torch.max(torch.from_numpy(final), 1)
+            # pred = pred.cpu().numpy()
+            pred = final.argmax(axis=1)
+            batch_time.update(time.time() - end)
+            '''
+            if save_vis:
+                save_output_images(pred, name, output_dir)
+                save_colorful_images(pred, name, output_dir + '_color',
+                                    CITYSCAPE_PALETTE)
+            if has_gt:
+                label = label.numpy()
+                hist += fast_hist(pred.flatten(), label.flatten(), num_classes)
+                logger.info('===> mAP {mAP:.3f}'.format(
+                    mAP=round(np.nanmean(per_class_iu(hist)) * 100, 2)))
+            end = time.time()
+            logger.info('Eval: [{0}/{1}]\t'
+                        'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                        'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                        .format(iter, len(eval_data_loader), batch_time=batch_time,
+                                data_time=data_time))
+            '''
+
+        
