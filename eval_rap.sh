@@ -1,7 +1,7 @@
 #!\bin\bash
 for dist in 0 50 100 200
 do
-    for step in 0 10 
+    for step in 20 50 
     do
         for arch in drn_d_22 resnet_d_22
         do

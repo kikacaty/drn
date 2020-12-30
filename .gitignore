@@ -11,3 +11,5 @@ log/*
 figs/*
 output*/
 log*/
+*log*/
+ngc_log/

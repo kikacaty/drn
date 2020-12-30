@@ -15,6 +15,7 @@ import numpy as np
 import shutil
 
 import sys
+import json
 from PIL import Image, ImageDraw
 import torch
 from torch import nn
@@ -216,7 +217,7 @@ class DRNSeg(nn.Module):
 
 class SegList(torch.utils.data.Dataset):
     def __init__(self, data_dir, phase, transforms, list_dir=None,
-                 out_name=False):
+                 out_name=False, rpa=False):
         self.list_dir = data_dir if list_dir is None else list_dir
         self.data_dir = data_dir
         self.out_name = out_name
@@ -225,6 +226,8 @@ class SegList(torch.utils.data.Dataset):
         self.image_list = None
         self.label_list = None
         self.bbox_list = None
+        self.json_list = None
+        self.rpa = rpa
         self.read_lists()
 
     def __getitem__(self, index):
@@ -237,6 +240,10 @@ class SegList(torch.utils.data.Dataset):
             if self.label_list is None:
                 data.append(data[0][0, :, :])
             data.append(self.image_list[index])
+        if self.json_list is not None:
+            with open(join(self.data_dir,self.json_list[index])) as f:
+                json_data = json.load(f)
+            data.append(json_data)
         return tuple(data)
 
     def __len__(self):
@@ -245,11 +252,15 @@ class SegList(torch.utils.data.Dataset):
     def read_lists(self):
         image_path = join(self.list_dir, self.phase + '_images.txt')
         label_path = join(self.list_dir, self.phase + '_labels.txt')
+        json_path = join(self.list_dir, self.phase + '_jsons.txt')
         assert exists(image_path)
         self.image_list = [line.strip() for line in open(image_path, 'r')]
         if exists(label_path):
             self.label_list = [line.strip() for line in open(label_path, 'r')]
             assert len(self.image_list) == len(self.label_list)
+        if exists(json_path) and self.rpa:
+            self.json_list = [line.strip() for line in open(json_path, 'r')]
+            assert len(self.json_list) == len(self.label_list)
 
 
 class SegListMS(torch.utils.data.Dataset):
@@ -430,119 +441,6 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
-
-
-def train_seg_crf(args):
-    batch_size = args.batch_size
-    num_workers = args.workers
-    crop_size = args.crop_size
-
-    print(' '.join(sys.argv))
-
-    for k, v in args.__dict__.items():
-        print(k, ':', v)
-
-    single_drnseg = DRNSeg(args.arch, args.classes, None,
-                          pretrained=True)
-    if args.pretrained:
-        single_drnseg.load_state_dict(torch.load(args.pretrained))
-    drnseg = torch.nn.DataParallel(single_drnseg).cuda()
-    if os.path.isfile(args.base_model):
-        print("=> loading checkpoint '{}'".format(args.base_model))
-        checkpoint = torch.load(args.base_model)
-        drnseg.load_state_dict(checkpoint['state_dict'])
-    else:
-        print("=> no checkpoint found at '{}'".format(args.base_model))
-
-    single_crf_model = CRF_helper(args.arch, args.classes, None,
-                          pretrained=True, drnseg=drnseg)
-
-    crf_model = torch.nn.DataParallel(single_crf_model).cuda()
-    criterion = nn.NLLLoss2d(ignore_index=255)
-
-    criterion.cuda()
-
-    # Data loading code
-    data_dir = args.data_dir
-    info = json.load(open(join(data_dir, 'info.json'), 'r'))
-    normalize = transforms.Normalize(mean=info['mean'],
-                                     std=info['std'])
-    t = []
-    if args.random_rotate > 0:
-        t.append(transforms.RandomRotate(args.random_rotate))
-    if args.random_scale > 0:
-        t.append(transforms.RandomScale(args.random_scale))
-    t.extend([transforms.RandomCrop(crop_size),
-              transforms.RandomHorizontalFlip(),
-              transforms.ToTensor(),
-              normalize])
-    train_loader = torch.utils.data.DataLoader(
-        SegList(data_dir, 'train', transforms.Compose(t),
-                list_dir=args.list_dir),
-        batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        pin_memory=True, drop_last=True
-    )
-    val_loader = torch.utils.data.DataLoader(
-        SegList(data_dir, 'val', transforms.Compose([
-            transforms.RandomCrop(crop_size),
-            transforms.ToTensor(),
-            normalize,
-        ]), list_dir=args.list_dir),
-        batch_size=batch_size, shuffle=False, num_workers=num_workers,
-        pin_memory=True, drop_last=True
-    )
-
-    # define loss function (criterion) and pptimizer
-    optimizer = torch.optim.SGD(single_crf_model.optim_parameters(),
-                                args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    cudnn.benchmark = True
-    best_prec1 = 0
-    start_epoch = 0
-
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            start_epoch = checkpoint['epoch']
-            best_prec1 = checkpoint['best_prec1']
-            crf_model.load_state_dict(checkpoint['state_dict'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-
-    if args.evaluate:
-        validate(val_loader, crf_model, criterion, eval_score=accuracy)
-        return
-
-    for epoch in range(start_epoch, args.epochs):
-        lr = adjust_learning_rate(args, optimizer, epoch)
-        logger.info('Epoch: [{0}]\tlr {1:.06f}'.format(epoch, lr))
-        # train for one epoch
-        train(train_loader, crf_model, criterion, optimizer, epoch,
-              eval_score=accuracy)
-
-        # evaluate on validation set
-        prec1 = validate(val_loader, crf_model, criterion, eval_score=accuracy)
-
-        is_best = prec1 > best_prec1
-        best_prec1 = max(prec1, best_prec1)
-        checkpoint_path = os.path.join(args.save_path, 'checkpoint_latest.pth.tar')
-        if not os.path.exists(args.save_path):
-            os.makedirs(args.save_path)
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'arch': args.arch,
-            'state_dict': crf_model.state_dict(),
-            'best_prec1': best_prec1,
-        }, is_best, filename=checkpoint_path)
-        if (epoch + 1) % args.save_iter == 0:
-            history_path = os.path.join(args.save_path, 'checkpoint_{:03d}.pth.tar'.format(epoch + 1))
-            shutil.copyfile(checkpoint_path, history_path)
 
 def train_seg(args):
     batch_size = args.batch_size
@@ -1084,7 +982,7 @@ class houdini_loss(nn.Module):
 def attack_rap(attack_data_loader, model, num_classes,
          output_dir='pred', has_gt=True, save_vis=False, 
          pgd_steps = 0, crf_model = None,
-         eval_num = 100, patch_dist = 0):
+         eval_num = 100, patch_dist = 0, ms_defense = False):
 
     target_labels = [
             5,6,7, # object
@@ -1189,10 +1087,6 @@ def attack_rap(attack_data_loader, model, num_classes,
             save_colorful_images(
                 pred, name, output_dir + '_color',
                 TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-            if crf_model:
-                save_colorful_images(
-                    pred_crf, name, output_dir + '_color_CRF',
-                    TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
             save_colorful_images_with_pointwise_mask(
                 pred, name, output_dir + '_color_patch',
                 TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
@@ -1217,23 +1111,9 @@ def attack_rap(attack_data_loader, model, num_classes,
             logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
                 mAP=round(cur_mAP,2),
                 avg_mAP=round(ttl_mAP/(iter+1))))
-                # CRF map
-            if crf_model:
-                cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                t_hist_crf += cur_hist_crf
-                hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
-                idx_list = [6,7,13]
-                cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
-                if math.isnan(cur_mAP_crf):
-                    ttl_mAP_crf += ttl_mAP_crf/iter
-                    # st()
-                else:
-                    ttl_mAP_crf += cur_mAP_crf
-                logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                    mAP=round(cur_mAP_crf,2),
-                    avg_mAP=round(ttl_mAP_crf/(iter+1))))
+
         end = time.time()
-        # st()
+        st()
         ious = per_class_iu(cur_hist) * 100
         logger.info(' '.join('{:.03f}'.format(i) for i in ious))
 
@@ -1278,11 +1158,12 @@ def attack(attack_data_loader, model, num_classes,
 
         data_time.update(time.time() - end)
 
+        st()
+
         height, width = image.shape[2:]
 
         patch_size = (50,300)
         target_size = 300
-        patch_pos = (450,1100)
         patch_pos = (520+patch_dist,1100)
         patch_rec = ((patch_pos[1] - patch_size[1]//2, patch_pos[0] - patch_size[0]//2),
             (patch_pos[1] + patch_size[1]//2, patch_pos[0] + patch_size[0]//2))
@@ -1294,8 +1175,7 @@ def attack(attack_data_loader, model, num_classes,
         target_mask = np.zeros_like(label)
         # target_mask = np.ones_like(label)
         perturb_mask = np.zeros_like(image)
-        target_mask[:,target_rec[0][1]:target_rec[1][1],
-            target_rec[0][0]:target_rec[1][0]] = 1
+        target_mask[:,target_rec[0][1]:target_rec[1][1],target_rec[0][0]:target_rec[1][0]] = 1
 
         target_mask = (np.any([label.numpy() == id for id in target_labels],axis = 0) & (target_mask == 1)).astype(np.int8) 
         
@@ -1325,195 +1205,90 @@ def attack(attack_data_loader, model, num_classes,
         eps_list = [10./255, 50./255, 100./255, 200./255]
         eps_list = [1.]
 
-        for step_size in step_size_list:
-            print('step size: ',step_size)
-            for eps in eps_list:
-                print('eps: ', eps)
+        if pgd_steps == 0:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
+        else:
+            adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5)
 
-                if pgd_steps == 0:
-                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
-                else:
-                    adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5)
+        image_var = Variable(adv_image)
 
-                image_var = Variable(adv_image)
+        # final : log softmax
+        # logits: logits
+        # middle: middle layers output
 
-                # final : log softmax
-                # logits: logits
-                # middle: middle layers output
+        final, final_x, logits, middle = model(image_var)
+        _, pred = torch.max(final, 1)
+        pred = pred.cpu().data.numpy()
+        batch_time.update(time.time() - end)
 
-                final, final_x, logits, middle = model(image_var)
-                _, pred = torch.max(final, 1)
-                pred = pred.cpu().data.numpy()
-                batch_time.update(time.time() - end)
+        adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
+        adv_img *= 255
 
-                adv_img = adv_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
-                adv_img *= 255
+        def inference_ms_image(image,ms = 2, split = False):
+            w, h = image.shape[2:]
+            scaled_image = F.interpolate(adv_image, scale_factor=ms, mode="bilinear", align_corners=True)
+            if split:
+                scaled_pred = torch.zeros(adv_image.shape[0],w*ms,h*ms)
+                for i in range(ms):
+                    for j in range(ms):
+                        image_ms = scaled_image[:,:,i*w:(i+1)*w,j*h:(j+1)*h]
+                        final, final_x, logits, middle = model(image_ms)
+                        scaled_pred[:,i*w:(i+1)*w,j*h:(j+1)*h] =  torch.max(final, 1)[1]
+            else:
+                image_ms = scaled_image
+                final, final_x, logits, middle = model(image_ms)
+                scaled_pred =  torch.max(final, 1)[1]
+            # pred = torch.squeeze(F.interpolate(torch.unsqueeze(scaled_pred,0), size=(w,h)),0)
+            pred = scaled_pred.cpu().data.numpy().astype(np.uint8)
 
-                POS_W = 3
-                POS_XY_STD = 1
-                Bi_W = 4
-                Bi_XY_STD = 67
-                Bi_RGB_STD = 10
-                crf_iter = 10
-                CRF_W = 4
-                CRF_XY_STD = 67
-                CRF_CHAN_STD = 0.1
-                # CRF defense
+            return pred
 
-                def CRF_postprocess(
-                    POS_W = 3, 
-                    POS_XY_STD = 1,
-                    Bi_W = 4,
-                    Bi_XY_STD = 67,
-                    Bi_RGB_STD = 3,
-                    crf_iter = 10,
-                    CRF_W = 4,
-                    CRF_XY_STD = 67,
-                    CRF_CHAN_STD = 0.1,
-                    PRED_W = 3, smooth=3):
+        ms_pred = inference_ms_image(adv_image);save_colorful_images(ms_pred, ('ms.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
 
-                    # for crf_iter in [1,5,10]:
-                    #     for CRF_W in [10]:
-                    #         for CRF_CHAN_STD in [0.01]:
-                    crf_model.eval()
+        st()
 
-                    print('Iter: {}, weight: {}, crf_chan_std: {}'.format(crf_iter, CRF_W, CRF_CHAN_STD))
-                    d = dcrf.DenseCRF2D(256, 128, 19)  # width, height, nlabels
-                    final_crf, final_crf_x, logits_crf, middle_crf = crf_model(image_var)
-                    resized_image = F.interpolate(image_var, size=final_crf_x.shape[2:], mode="bilinear", align_corners=True)
-                    normalized_final_x = (final_x - final_x.mean())/final_x.std()
-                    probs = F.softmax(normalized_final_x, dim = 1)
+        output_probs = F.softmax(logits, dim = 1)[0].cpu().data.numpy().copy()
+        print(output_probs.shape)
+        # fg_mask = seg_parse(model, adv_image.cpu().data.numpy(),pred,target_labels,5)
+        # crf_dense(adv_image.cpu().data.numpy(), output_probs,fg_mask)
+        # save_colorful_images(pred, ('pred.png',), 'test',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
 
-                    # set unary
-                    U = unary_from_softmax(probs[0].cpu().data.numpy().copy())
-                    d.setUnaryEnergy(U) 
+        if save_vis:
+            save_output_images(pred, name, output_dir)
+            save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
+            save_colorful_images(
+                pred, name, output_dir + '_color',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
+            save_colorful_images_with_pointwise_mask(
+                pred, name, output_dir + '_color_patch',
+                TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
+                p_mask = perturb_mask,
+                t_mask = target_mask,
+                rf_mask = rf_mask_bit)
+        if has_gt:
+            label_np = label.numpy()
+            # changing all other labels to -1
+            cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
+            t_hist += cur_hist
+            hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
+            # idx_list = [6,7,13]
+            # cur_mAP = np.nanmean(per_class_iu(cur_hist)[idx_list]) * 100
+            cur_mAP = np.nanmean(per_class_iu(cur_hist)) * 100
 
-                    _, pred_crf = torch.max(final_crf_x, 1)
-                    logits_img_crf = pred_crf.cpu().data.numpy().copy()
-
-                    _, pred_small = torch.max(final_x, 1)
-                    logits_img = pred_small.cpu().data.numpy().copy()
-
-
-                    # set pairwise_energy
-                    d_img = resized_image.cpu().data.numpy() * NORM_STD.reshape(1,3,1,1) + NORM_MEAN.reshape(1,3,1,1)
-                    d_img *= 255
-                    d_img = np.ascontiguousarray(np.moveaxis(d_img[0].astype(np.uint8),0,-1))
-
-                    logits_img_crf = np.moveaxis(final_crf_x[0].cpu().data.numpy().copy(),0,-1)
-                    logits_img_crf = gaussian_filter(logits_img_crf,sigma=smooth)
-                    logits_img_crf = np.moveaxis(logits_img_crf,-1,0)
-
-                    pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img_crf, chdim=0)
-                    if CRF_W > 0:
-                        d.addPairwiseEnergy(pairwise_energy, compat=CRF_W) 
-                    # pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=final_x[0].cpu().data.numpy().copy(), chdim=0)
-                    pairwise_energy = create_pairwise_bilateral(sdims=(CRF_XY_STD,CRF_XY_STD), schan=(CRF_CHAN_STD,), img=logits_img, chdim=0)
-                    if PRED_W > 0:
-                        d.addPairwiseEnergy(pairwise_energy, compat=PRED_W) 
-
-                    # d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL,normalization=dcrf.NORMALIZE_SYMMETRIC)
-
-                    # # This adds the color-dependent term, i.e. features are (x,y,r,g,b).
-
-                    # d.addPairwiseBilateral(sxy=(80, 80), srgb=(13, 13, 13), rgbim=d_img,
-                    #                     compat=10,
-                    #                     kernel=dcrf.DIAG_KERNEL,
-                    #                     normalization=dcrf.NORMALIZE_SYMMETRIC)
-
-                    d.addPairwiseGaussian(sxy=POS_XY_STD, compat=POS_W)
-                    d.addPairwiseBilateral(sxy=Bi_XY_STD, srgb=Bi_RGB_STD, rgbim=d_img, compat=Bi_W)
-
-                    Q = d.inference(crf_iter)
-                    print('KL:', d.klDivergence(Q)/np.array(Q).shape[1])
-
-                    # reverse to logits
-                    crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_x).sum(1))
-                    # crf_x = torch.log(torch.from_numpy(np.array(Q).reshape([1,19,128,256])).cuda()) + torch.log(torch.exp(normalized_final_crf_x).sum(1))
-                    crf_y = F.softmax(F.interpolate(crf_x, size=final_crf.shape[2:], mode="bilinear", align_corners=True),dim=1)
-                    # crf_y = F.softmax(model.module.up(final_x),dim=1);pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
-                    
-
-                    # Find out the most probable class for each pixel.
-                    # pred_crf = np.argmax(Q, axis=0).reshape([1,128,256])
-                    pred_crf = np.argmax(crf_y.cpu().detach().numpy(), axis=1).reshape([1,1024,2048])
-
-                    save_colorful_images(pred_crf, name, output_dir + '_color_CRF',TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-
-                    label_np = label.numpy()
-                    cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                    idx_list = [6,7,13]
-                    cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
-                    logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                        mAP=round(cur_mAP_crf,2),
-                        avg_mAP=round(ttl_mAP_crf/(iter+1))))
-
-                if crf_model:
-                        
-                    CRF_postprocess()
-                    # CRF_postprocess(CRF_W = 30,PRED_W=0,Bi_RGB_STD = 60,Bi_W=1,POS_W=0)
-                    st()
-
-                if save_vis:
-                    save_output_images(pred, name, output_dir)
-                    save_output_images(np.moveaxis(adv_img,1,-1), name, output_dir+'_adv')
-                    save_colorful_images(
-                        pred, name, output_dir + '_color',
-                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-                    if crf_model:
-                        save_colorful_images(
-                            pred_crf, name, output_dir + '_color_CRF',
-                            TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE)
-                    save_colorful_images_with_pointwise_mask(
-                        pred, name, output_dir + '_color_patch',
-                        TRIPLET_PALETTE if num_classes == 3 else CITYSCAPE_PALETTE,
-                        p_mask = perturb_mask,
-                        t_mask = target_mask,
-                        rf_mask = rf_mask_bit)
-                if has_gt:
-                    label_np = label.numpy()
-                    # changing all other labels to -1
-                    cur_hist = fast_hist((pred * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                    t_hist += cur_hist
-                    hist += fast_hist(pred.flatten(), label_np.flatten(), num_classes)
-                    idx_list = [6,7,13]
-                    cur_mAP = np.nanmean(per_class_iu(cur_hist)[idx_list]) * 100
-
-                    if math.isnan(cur_mAP):
-                        ttl_mAP += ttl_mAP/iter
-                        # st()
-                    else:
-                        ttl_mAP += cur_mAP
-                    logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                        mAP=round(cur_mAP,2),
-                        avg_mAP=round(ttl_mAP/(iter+1))))
-                    
-                    # CRF map
-                    if crf_model:
-                        cur_hist_crf = fast_hist((pred_crf * target_mask).flatten(), (label_np*target_mask + target_mask - 1).flatten(), num_classes)
-                        t_hist_crf += cur_hist_crf
-                        hist_crf += fast_hist(pred_crf.flatten(), label_np.flatten(), num_classes)
-                        idx_list = [6,7,13]
-                        cur_mAP_crf = np.nanmean(per_class_iu(cur_hist_crf)[idx_list]) * 100
-                        if math.isnan(cur_mAP_crf):
-                            ttl_mAP_crf += ttl_mAP_crf/iter
-                            # st()
-                        else:
-                            ttl_mAP_crf += cur_mAP_crf
-                        logger.info('===> CRF mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
-                            mAP=round(cur_mAP_crf,2),
-                            avg_mAP=round(ttl_mAP_crf/(iter+1))))
-                end = time.time()
+            if math.isnan(cur_mAP):
+                ttl_mAP += ttl_mAP/iter
                 # st()
-                logger.info('Eval: [{0}/{1}]\t'
-                            'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                            'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                            .format(iter, len(attack_data_loader), batch_time=batch_time,
-                                    data_time=data_time))
-
+            else:
+                ttl_mAP += cur_mAP
+            logger.info('===> mAP {mAP:.3f}, avg mAP {avg_mAP:.3f}'.format(
+                mAP=round(cur_mAP,2),
+                avg_mAP=round(ttl_mAP/(iter+1))))
+            
+            ious = per_class_iu(cur_hist) * 100	
+            logger.info(' '.join('{:.03f}'.format(i) for i in ious))
 
     if has_gt: #val
-        ious = per_class_iu(hist) * 100
+        ious = per_class_iu(t_hist) * 100
         logger.info(' '.join('{:.03f}'.format(i) for i in ious))
         return round(np.nanmean(ious), 2)
 
@@ -1690,6 +1465,7 @@ def attack_seg(args):
     info = json.load(open(join(data_dir, 'info.json'), 'r'))
     normalize = transforms.Normalize(mean=info['mean'], std=info['std'])
     scales = [0.5, 0.75, 1.25, 1.5, 1.75]
+
     if args.ms:
         dataset = SegListMS(data_dir, phase, transforms.Compose([
             transforms.ToTensor(),
@@ -1723,20 +1499,7 @@ def attack_seg(args):
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
     # crf model
-    if args.crf_model:
-        single_crf_model = CRF_helper(args.arch, args.classes, pretrained_model=None,
-                          pretrained=False,drnseg=model)
-        crf_model = torch.nn.DataParallel(single_crf_model).cuda()
-        if os.path.isfile(args.crf_model):
-            logger.info("=> loading checkpoint '{}'".format(args.crf_model))
-            checkpoint = torch.load(args.crf_model)
-            crf_model.load_state_dict(checkpoint['state_dict'])
-            logger.info("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.crf_model, checkpoint['epoch']))
-        else:
-            logger.info("=> no checkpoint found at '{}'".format(args.crf_model))
-    else:
-        crf_model = None
+    crf_model = args.crf_model
 
     output_base_path = '{}_{}_step_{}_evalnum_{}_dist_{}'.format(args.output_path, args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
     print('Saving output to {}'.format(output_base_path))
@@ -1849,7 +1612,10 @@ def main():
             os.makedirs(args.log_dir,exist_ok=True)
         log_filename = '{}_step_{}_evalnum_{}_dist_{}.log'.format(args.arch, args.pgd_steps, args.eval_num,args.patch_dist)
         log_path = os.path.join(args.log_dir,log_filename)
-        logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
+    else:
+        log_path = 'logs/{}.log'.format(args.arch)
+    print('Saving to log: ', log_path)
+    logging.basicConfig(filename=log_path, filemode='w',format=FORMAT)
 
     global logger
     logger = logging.getLogger(__name__)
