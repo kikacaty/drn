@@ -1024,6 +1024,8 @@ def attack(attack_data_loader, model, num_classes,
 
         data_time.update(time.time() - end)
 
+        st()
+
         height, width = image.shape[2:]
 
         patch_size = (50,300)
