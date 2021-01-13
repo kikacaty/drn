@@ -33,6 +33,10 @@ import pydensecrf.densecrf as dcrf
 from pydensecrf.utils import unary_from_labels, unary_from_softmax, create_pairwise_bilateral
 from scipy.ndimage.filters import gaussian_filter
 
+from attack import pgd
+
+from env_var import *
+
 from pdb import set_trace as st
 
 try:
@@ -301,6 +305,49 @@ class SegListMS(torch.utils.data.Dataset):
         if exists(label_path):
             self.label_list = [line.strip() for line in open(label_path, 'r')]
             assert len(self.image_list) == len(self.label_list)
+
+class FilteredSegListMS(torch.utils.data.Dataset):
+    def __init__(self, data_dir, phase, transforms, scales, list_dir=None):
+        self.list_dir = data_dir if list_dir is None else list_dir
+        self.data_dir = data_dir
+        self.phase = phase
+        self.transforms = transforms
+        self.image_list = None
+        self.label_list = None
+        self.bbox_list = None
+        self.read_lists()
+        self.scales = scales
+
+    def __getitem__(self, index):
+        data = [Image.open(join(self.data_dir, self.image_list[index]))]
+        w, h = data[0].size
+        if self.label_list is not None:
+            data.append(Image.open(
+                join(self.data_dir, self.label_list[index])))
+        # data = list(self.transforms(*data))
+        out_data = list(self.transforms(*data))
+        ms_images = [self.transforms(data[0].resize((int(w * s), int(h * s)),
+                                                    Image.BICUBIC))[0]
+                     for s in self.scales]
+        out_data.append(self.image_list[index])
+        out_data.extend(ms_images)
+        return tuple(out_data)
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def read_lists(self):
+        image_path = join(self.list_dir, self.phase + '_images.txt')
+        label_path = join(self.list_dir, self.phase + '_labels.txt')
+        bbox_path = join(self.list_dir, self.phase + '_jsons.txt')
+        assert exists(image_path)
+        self.image_list = [line.strip() for line in open(image_path, 'r')]
+        if exists(label_path):
+            self.label_list = [line.strip() for line in open(label_path, 'r')]
+            assert len(self.image_list) == len(self.label_list)
+        if exists(bbox_path):
+            self.bbox_list = [line.strip() for line in open(bbox_path, 'r')]
+            assert len(self.image_list) == len(self.bbox_list)
 
 
 def validate(val_loader, model, criterion, eval_score=None, print_freq=10):
@@ -793,190 +840,6 @@ def measureRFSize_pt(model, image, label, target_mask,thres = 0):
 
     return h,w,coord_mask,pt_wise_mask
 
-def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/255., iters=10, alpha = 1e-1, beta = 2., restarts=1, target_label=None, rap=False):
-    images = image.cuda()
-    t_labels = torch.ones_like(label)
-    labels = t_labels.cuda(async=True)
-
-    u_labels = label.cuda(async=True)
-
-    # images = torch.autograd.Variable(images)
-    # labels = torch.autograd.Variable(labels)
-    u_labels = torch.autograd.Variable(u_labels)
-
-    upper_mask = np.zeros_like(target_mask)
-    upper_mask[:,0:430,:] = 1
-    upper_mask = torch.from_numpy(upper_mask).cuda()
-    lower_mask = np.zeros_like(target_mask)
-    lower_mask[:,430:,:] = 1
-    lower_mask = torch.from_numpy(lower_mask).cuda()
-
-    target_mask = torch.from_numpy(target_mask).cuda()
-    perturb_mask = torch.from_numpy(perturb_mask).cuda()
-
-    mean = torch.from_numpy(NORM_MEAN).float().cuda().unsqueeze(0)
-    mean = mean[..., None, None]
-    std = torch.from_numpy(NORM_STD).float().cuda().unsqueeze(0)
-    std = std[..., None, None]
-
-    # loss = nn.CrossEntropyLoss()
-    loss = nn.NLLLoss2d(ignore_index=255)
-
-    h_loss = houdini_loss()
-
-    best_adv_img = [images.data, -1e8]
-
-    ori_images = images.data * std + mean
-
-    for j in range(restarts):
-        delta = torch.rand_like(images, requires_grad=True)
-        # delta = torch.zeros_like(images, requires_grad=True)
-        delta.data = (delta.data * 2 * eps - eps) * perturb_mask
-
-        for i in range(iters) :
-
-            start = time.time()
-            step_size  = np.max([1e-3, step_size * 0.99])
-            images.requires_grad = False
-            delta.requires_grad = True
-            outputs = model((torch.clamp(((images*std+mean)+delta),min=0, max=1)- mean)/std)[0]
-
-            model.zero_grad()
-
-            # remove attack
-            cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
-
-            # rap attack
-            if rap:
-                if target_label:
-                    # target attack
-                    cost = - loss(outputs*target_mask, labels*target_label*target_mask)
-                else:
-                    # untargeted attack
-                    cost = loss(outputs*target_mask, u_labels*target_mask)
-
-            # targeted attack
-            # cost = -loss(outputs*target_mask, labels*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
-            # cost = -h_loss(outputs*target_mask, labels*target_mask) - alpha * h_loss(outputs*perturb_mask[:,0,:,:], labels*perturb_mask[:,0,:,:])
-
-            # untargeted attack
-            # cost = loss(outputs*target_mask, u_labels*target_mask)
-            # cost = loss(outputs*target_mask, u_labels*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], labels*perturb_mask[:,0,:,:])
-
-            # mixed attack
-            # cost = -loss(outputs*target_mask, labels*2*target_mask) - loss(outputs*target_mask, labels*0*target_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
-
-            # print(loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask).data, loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask).data, loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:]).data)
-            # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
-            # cost = - 3*loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - loss(outputs*target_mask*lower_mask, labels*0*target_mask*lower_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
-            # cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
-
-            cost.backward()
-            # print(i,cost)
-
-            adv_images = (images*std+mean) + delta + step_size*eps*delta.grad.sign() * perturb_mask
-            eta = torch.clamp(adv_images - ori_images, min=-eps, max=eps)
-            delta = torch.clamp(ori_images + eta, min=0, max=1).detach_() - ori_images
-
-
-            if cost.cpu().data.numpy() > best_adv_img[1]:
-                best_adv_img = [delta.data, cost.cpu().data.numpy()]
-
-    return (torch.clamp(((images*std+mean)+best_adv_img[0]),min=0, max=1)- mean)/std
-
-def cw(model, image, label, target_mask, perturb_mask, step_size = 0.05, eps=10/255., iters=10, alpha = 0.1):
-    images = image.cuda()
-    # t_labels = torch.ones_like(label)
-    t_labels = torch.zeros_like(label)
-    labels = t_labels.cuda(async=True)
-
-    u_labels = label.cuda(async=True)
-
-    images = torch.autograd.Variable(images)
-    labels = torch.autograd.Variable(labels)
-    u_labels = torch.autograd.Variable(u_labels)
-
-    target_mask = torch.from_numpy(target_mask).cuda()
-    perturb_mask = torch.from_numpy(perturb_mask).cuda()
-
-    mean = torch.from_numpy(NORM_MEAN).float().cuda().unsqueeze(0)
-    mean = mean[..., None, None]
-    std = torch.from_numpy(NORM_STD).float().cuda().unsqueeze(0)
-    std = std[..., None, None]
-
-    # loss = nn.CrossEntropyLoss()
-    loss = nn.NLLLoss2d(ignore_index=255)
-
-    best_adv_img = [images.data, -1e8]
-
-    ori_images = images.data * std + mean
-
-    # scaling the attack eps
-    # eps *= 1.7585+3.8802
-
-    h_loss = houdini_loss()
-
-    for i in range(iters) :
-        images.requires_grad = True
-        outputs = model(images)[0]
-
-        model.zero_grad()
-
-        # cost = -loss(outputs*target_mask, labels*target_mask) #+ loss(outputs*target_mask, u_labels*target_mask)
-        # cost = loss(outputs*target_mask, u_labels*target_mask)
-        cost = - h_loss(outputs*target_mask, labels*target_mask)
-        print(cost)
-
-        cost.backward()
-
-        adv_images = (images*std+mean) + step_size*eps*images.grad * perturb_mask / torch.max(torch.abs(images.grad * perturb_mask))
-        # adv_images = (images*std+mean) + step_size*eps*images.grad / torch.max(torch.abs(images.grad))
-        eta = torch.clamp(adv_images - ori_images, min=-eps, max=eps)
-        images = ((torch.clamp(ori_images + eta, min=0, max=1) - mean)/std).detach_()
-
-        if cost.cpu().data.numpy() > best_adv_img[1]:
-            best_adv_img = [images.data, cost.cpu().data.numpy()]
-
-
-    return best_adv_img[0]
-
-class houdini_loss(nn.Module):
-    def __init__(self, use_cuda=True, num_class=19, ignore_index=255):
-        super(houdini_loss, self).__init__()
-        # self.cross_entropy = nn.CrossEntropyLoss(ignore_index=255)
-        self.use_cuda = use_cuda
-        self.num_class = num_class
-        self.ignore_index = ignore_index
-
-    def forward(self, logits, target):
-        pred = logits.max(1)[1].data
-        target = target.data
-        size = list(target.size())
-        if self.ignore_index is not None:
-            pred[pred == self.ignore_index] = self.num_class
-            target[target == self.ignore_index] = self.num_class
-        pred = torch.unsqueeze(pred, dim=1)
-        target = torch.unsqueeze(target, dim=1)
-        size.insert(1, self.num_class+1)
-        pred_onehot = torch.zeros(size)
-        target_onehot = torch.zeros(size)
-        if self.use_cuda:
-            pred_onehot = pred_onehot.cuda()
-            target_onehot = target_onehot.cuda()
-        pred_onehot = pred_onehot.scatter_(1, pred, 1).narrow(1, 0, self.num_class)
-
-        target_onehot = target_onehot.scatter_(1, target, 1).narrow(1, 0, self.num_class)
-        pred_onehot = Variable(pred_onehot)
-        target_onehot = Variable(target_onehot)
-        neg_log_softmax = -F.log_softmax(logits, dim=1)
-        # print(logits.size())
-        # print(neg_log_softmax.size())
-        # print(target_onehot.size())
-        twod_cross_entropy = torch.sum(neg_log_softmax*target_onehot, dim=1)
-        pred_score = torch.sum(logits*pred_onehot, dim=1)
-        target_score = torch.sum(logits*target_onehot, dim=1)
-        mask = 0.5 + 0.5 * (((pred_score-target_score)/math.sqrt(2)).erf())
-        return torch.mean(mask * twod_cross_entropy)
 
 # remote adversarial patch attack
 def attack_rap(attack_data_loader, model, num_classes,
@@ -1009,7 +872,8 @@ def attack_rap(attack_data_loader, model, num_classes,
 
         height, width = image.shape[2:]
 
-        patch_size = (50,300)
+        # patch_size = (50,300)
+        patch_size = (100,200)
         target_size = 300
         patch_pos = (450,1100)
         patch_pos = (520+patch_dist,1100)
@@ -1044,8 +908,9 @@ def attack_rap(attack_data_loader, model, num_classes,
         #     patch_rec[0][0]:patch_rec[1][0]] = 1
 
         # measure receptive field
-        rf_h, rf_w, rf_mask, rf_mask_bit = measureRFSize_pt(model, image, label, target_mask, thres = 1.)
-        # print('receptive size: ',rf_h, rf_w)
+        rf_h, rf_w, rf_mask, rf_mask_bit = measureRFSize_pt(
+            model, image, label, target_mask, thres = 1e-8)
+        print('receptive size: ',rf_h, rf_w)
 
         # Tuning attack hyper params
         step_size_list = [0.1, 0.2, 0.5, 1.0]
@@ -1065,7 +930,8 @@ def attack_rap(attack_data_loader, model, num_classes,
             adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
         else:
             adv_image = pgd(model,image,label,loss_mask,perturb_mask, 
-            step_size = 0.1, eps=200./255, iters=pgd_steps, alpha=1, restarts=5, rap=True)
+                step_size = 0.05, eps=200./255, iters=50, 
+                alpha=1, restarts=1, rap=True,target_label = 2)
 
         image_var = Variable(adv_image)
 
@@ -1157,8 +1023,6 @@ def attack(attack_data_loader, model, num_classes,
         print('==> Attacking image [{}/{}]...'.format(eval_cnt,eval_num))
 
         data_time.update(time.time() - end)
-
-        st()
 
         height, width = image.shape[2:]
 
@@ -1588,6 +1452,7 @@ def parse_args():
     parser.add_argument('--eval-num', default=100, type=int)
     parser.add_argument('--patch-dist', default=0, type=int)
     parser.add_argument('--rap', action='store_true')
+    parser.add_argument('--grad_defense', action='store_true')
 
 
 
