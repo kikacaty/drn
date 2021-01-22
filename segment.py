@@ -909,7 +909,7 @@ def attack_rap(attack_data_loader, model, num_classes,
 
         # measure receptive field
         rf_h, rf_w, rf_mask, rf_mask_bit = measureRFSize_pt(
-            model, image, label, target_mask, thres = 1e-8)
+            model, image, label, target_mask, thres = 1e-4)
         print('receptive size: ',rf_h, rf_w)
 
         # Tuning attack hyper params
@@ -930,8 +930,8 @@ def attack_rap(attack_data_loader, model, num_classes,
             adv_image = pgd(model,image,label,loss_mask,perturb_mask, step_size = 0.1, eps=0./255, iters=1, alpha=1)
         else:
             adv_image = pgd(model,image,label,loss_mask,perturb_mask, 
-                step_size = 0.05, eps=200./255, iters=50, 
-                alpha=1, restarts=1, rap=True,target_label = 2)
+                step_size = 0.05, eps=200./255, iters=150, 
+                alpha=1, restarts=1, rap=True,target_label = 10)
 
         image_var = Variable(adv_image)
 

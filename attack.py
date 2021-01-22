@@ -9,8 +9,11 @@ from torchvision import datasets, transforms
 from torch.autograd import Variable
 from torch.nn import functional as F
 
+import cv2
+
 from env_var import *
 
+from pdb import set_trace as st
 
 
 
@@ -51,8 +54,8 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
 
     for j in range(restarts):
         delta = torch.rand_like(images, requires_grad=True)
-        # delta = torch.zeros_like(images, requires_grad=True)
-        delta.data = (delta.data * 2 * eps - eps) * perturb_mask
+        delta = torch.zeros_like(images, requires_grad=True)
+        # delta.data = (delta.data * 2 * eps - eps) * perturb_mask
 
         for i in range(iters) :
 
@@ -198,3 +201,26 @@ class houdini_loss(nn.Module):
         target_score = torch.sum(logits*target_onehot, dim=1)
         mask = 0.5 + 0.5 * (((pred_score-target_score)/math.sqrt(2)).erf())
         return torch.mean(mask * twod_cross_entropy)
+
+
+def transform_adv_patch(bg_img_path, patch_pos):
+    pass
+
+if __name__ == '__main__':
+    img = cv2.imread('attack_bg/attack_patch.jpg')
+
+    height, width = 300,300
+    res = cv2.resize(img,(width, height), interpolation = cv2.INTER_CUBIC)
+
+    pts1 = np.float32([[100,100],[200,100],[0,300],[300,300]])
+    pts2 = np.float32([[1,1],[299,1],[1,299],[299,299]])
+
+    M = cv2.getPerspectiveTransform(pts2,pts1)
+
+    dst = cv2.warpPerspective(res,M,(300,300))
+
+    mask_img = np.ones([300,300]) * 255
+    mask_dst = cv2.warpPerspective(mask_img,M,(300,300))
+    mask = (mask_dst == 255)
+
+    cv2.imwrite('test.png', dst)
