@@ -931,7 +931,7 @@ def attack_rap(attack_data_loader, model, num_classes,
         else:
             adv_image = pgd(model,image,label,loss_mask,perturb_mask, 
                 step_size = 0.05, eps=200./255, iters=150, 
-                alpha=1, restarts=1, rap=True,target_label = 10)
+                alpha=1, restarts=1, rap=True,target_label = 0)
 
         image_var = Variable(adv_image)
 
@@ -1023,8 +1023,6 @@ def attack(attack_data_loader, model, num_classes,
         print('==> Attacking image [{}/{}]...'.format(eval_cnt,eval_num))
 
         data_time.update(time.time() - end)
-
-        st()
 
         height, width = image.shape[2:]
 

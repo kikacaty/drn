@@ -68,6 +68,7 @@ def pgd(model, image, label, target_mask, perturb_mask, step_size = 0.1, eps=10/
             model.zero_grad()
 
             # remove attack
+            st()
             cost = - loss(outputs*target_mask*upper_mask, labels*2*target_mask*upper_mask) - alpha * loss(outputs*perturb_mask[:,0,:,:], u_labels*perturb_mask[:,0,:,:])
 
             # rap attack
@@ -204,7 +205,25 @@ class houdini_loss(nn.Module):
 
 
 def transform_adv_patch(bg_img_path, patch_pos):
-    pass
+    img = cv2.imread('attack_bg/attack_patch.jpg')
+
+    height, width = 300,300
+    res = cv2.resize(img,(width, height), interpolation = cv2.INTER_CUBIC)
+
+    pts1 = np.float32([[100,100],[200,100],[0,300],[300,300]])
+    pts2 = np.float32([[1,1],[299,1],[1,299],[299,299]])
+
+    M = cv2.getPerspectiveTransform(pts2,pts1)
+
+    dst = cv2.warpPerspective(res,M,(300,300))
+
+    mask_img = np.ones([300,300]) * 255
+    mask_dst = cv2.warpPerspective(mask_img,M,(300,300))
+    mask = (mask_dst == 255)
+
+    # cv2.imwrite('test.png', dst)
+
+    return dst, mask
 
 if __name__ == '__main__':
     img = cv2.imread('attack_bg/attack_patch.jpg')
@@ -223,4 +242,4 @@ if __name__ == '__main__':
     mask_dst = cv2.warpPerspective(mask_img,M,(300,300))
     mask = (mask_dst == 255)
 
-    cv2.imwrite('test.png', dst)
+    cv2.imwrite('test.png', mask)
